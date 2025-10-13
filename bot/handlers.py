@@ -37,11 +37,20 @@ from .keyboards import (
 
 logger = logging.getLogger(__name__)
 
+for noisy in ["sqlalchemy.engine", "alembic", "aiogram.event"]:
+    logging.getLogger(noisy).setLevel(logging.WARNING)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+
 router = Router()
 
 image_providers = init_image_providers(
     comet_api_key=COMET_API_KEY,
-    openrouter_api_key=OPENROUTER_API_KEY,
+    # openrouter_api_key=OPENROUTER_API_KEY,
+    openrouter_api_key=None,
     comet_base_url=COMET_BASE_URL,
     openrouter_base_url=OPENROUTER_BASE_URL,
 )
@@ -50,7 +59,8 @@ if not image_providers:
 
 prompt_providers = init_prompt_providers(
     comet_api_key=COMET_API_KEY,
-    openrouter_api_key=OPENROUTER_API_KEY,
+    # openrouter_api_key=OPENROUTER_API_KEY,
+    openrouter_api_key=None,
     comet_base_url=COMET_BASE_URL,
     openrouter_base_url=OPENROUTER_BASE_URL,
     prompt_model=PROMPT_MODEL,
@@ -194,13 +204,6 @@ async def save_photo(message: Message, bot: Bot):
         await message.answer("Не распознали пользователя.")
         return
 
-    caption = (message.caption or "").strip().lower()
-    if caption.startswith("/gen") or caption.startswith("/start"):
-        return
-
-    if message.reply_to_message:
-        return
-
     photo = message.photo[-1]
     try:
         file_bytes, filename = await fetch_file_bytes(bot, photo.file_id)
@@ -215,6 +218,7 @@ async def save_photo(message: Message, bot: Bot):
 
         try:
             object_key, url = await upload_bytes(file_bytes, filename, message.from_user.id)
+            logger.info(f" url {url}")
         except S3ConfigError as exc:
             logger.exception("S3 configuration error: %s", exc)
             await message.answer("Хранилище изображений не настроено. Сообщи администратору.")
@@ -234,7 +238,7 @@ async def save_photo(message: Message, bot: Bot):
             logger.warning("Failed to delete old S3 object %s: %s", old_object_key, exc)
 
     await message.answer(
-        "Фото обновлено! Используй <code>/gen_photo &lt;описание&gt;</code> для генераций с учётом снимка."
+        "Фото обновлено! Используй <code>/gen &lt;описание&gt;</code> для генераций с учётом снимка."
     )
 
 
@@ -313,12 +317,15 @@ async def generate_with_photo(message: Message, command: CommandObject, bot: Bot
 
 @router.message(F.text & ~F.via_bot & ~F.text.startswith("/"))
 async def handle_post(message: Message, state: FSMContext):
+
+    logger.info('starting promts from message')
     if not message.from_user or not message.text:
         return
 
     normalized = normalize_text(message.text)
     prompts: List[str] = []
     try:
+        logger.info('trying to generate from models')
         prompts = await prompt_service.generate(normalized, PROMPT_SUGGESTION_COUNT)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Prompt generation failed: %s", exc)

@@ -7,7 +7,9 @@ import aiohttp
 from openai import OpenAI
 
 from .base import BaseProvider, BasePromptProvider
+import logging
 
+logger = logging.getLogger(__name__) 
 
 class CometProvider(BaseProvider):
     def __init__(self, api_key: str, base_url: str = "https://api.cometapi.com/v1beta"):
@@ -188,7 +190,7 @@ class CometPromptProvider(BasePromptProvider):
         self,
         api_key: str,
         base_url: str = "https://api.cometapi.com/v1beta",
-        model: str = "models/gemini-2.0-flash-exp:generateContent",
+        model: str = "models/gemini-2.0-flash:generateContent",
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
@@ -202,8 +204,10 @@ class CometPromptProvider(BasePromptProvider):
         url = f"{self.base_url}/{self.model}"
         instruction = (
             "Сгенерируй {count} креативных промптов для генерации изображений на основе следующего текста. "
-            "Ответ верни в формате JSON списка строк без дополнительных комментариев."
+            "Ответ верни в формате JSON списка строк без дополнительных комментариев. Сделай промпты на русском языке"
         ).format(count=count)
+
+        logger.info(f"use Comet with model {self.model} with prompt {instruction}")
         payload = {
             "contents": [
                 {
@@ -226,6 +230,7 @@ class CometPromptProvider(BasePromptProvider):
                 result = await resp.json()
                 try:
                     raw_text = result["candidates"][0]["content"]["parts"][0]["text"]
+                    logger.info(f"Comet return {raw_text}")
                 except (KeyError, IndexError) as exc:
                     raise RuntimeError(f"CometPromptProvider invalid response: {result}") from exc
         return _normalize_prompt_list(raw_text, count)

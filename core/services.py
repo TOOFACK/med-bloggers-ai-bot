@@ -55,6 +55,7 @@ class PromptService:
 
         errors: list[str] = []
         for provider in self.providers:
+            logger.info(f"trying to use {provider} as prompt generator")
             try:
                 prompts = await provider.generate_prompts(text, count)
             except Exception as exc:  # noqa: BLE001

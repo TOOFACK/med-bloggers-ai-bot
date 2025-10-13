@@ -20,7 +20,7 @@ def _to_sync_url(url: str | None) -> str:
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 config.set_main_option("sqlalchemy.url", _to_sync_url(DB_URL))
 

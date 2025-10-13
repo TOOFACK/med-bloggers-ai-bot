@@ -18,7 +18,7 @@ def prompt_suggestions_keyboard(message_id: int, prompts: list[str]) -> InlineKe
     builder = InlineKeyboardBuilder()
     for idx, prompt in enumerate(prompts):
         builder.button(
-            text=truncate_for_button(prompt),
+            text=f"Использовать промпт {idx}",
             callback_data=PromptChoiceCallback(message_id=message_id, index=idx).pack(),
         )
     builder.button(
