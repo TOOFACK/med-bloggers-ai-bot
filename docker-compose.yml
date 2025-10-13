@@ -1,0 +1,49 @@
+services:
+  db:
+    image: postgres:15
+    restart: always
+    environment:
+      POSTGRES_USER: bot
+      POSTGRES_PASSWORD: bot
+      POSTGRES_DB: botdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bot -d botdb -h localhost"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+
+
+  migrate:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    command: >
+      bash -c "./wait-for-db.sh && alembic upgrade head"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://bot:bot@db:5432/botdb
+    volumes:
+      - .:/app
+    restart: "no"
+
+  bot:
+    build: .
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    command: python app.py
+    environment:
+      DATABASE_URL: postgresql+asyncpg://bot:bot@db:5432/botdb
+    ports:
+      - "8080:8080"
+    restart: always
+    volumes:
+      - .:/app
+
+volumes:
+  pgdata:
+
