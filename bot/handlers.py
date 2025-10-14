@@ -35,6 +35,8 @@ from .keyboards import (
     prompt_suggestions_keyboard,
 )
 
+import asyncio
+from aiogram import types
 logger = logging.getLogger(__name__)
 
 for noisy in ["sqlalchemy.engine", "alembic", "aiogram.event"]:
@@ -61,7 +63,6 @@ prompt_providers = init_prompt_providers(
     comet_api_key=COMET_API_KEY,
     # openrouter_api_key=OPENROUTER_API_KEY,
     openrouter_api_key=None,
-    comet_base_url=COMET_BASE_URL,
     openrouter_base_url=OPENROUTER_BASE_URL,
     prompt_model=PROMPT_MODEL,
 )
@@ -70,6 +71,35 @@ if not prompt_providers:
 
 model_service = ModelService(image_providers)
 prompt_service = PromptService(prompt_providers)
+
+
+
+async def start_loading_animation(message: types.Message, text="⏳ Генерируем", delay=0.5):
+    """
+    Показывает анимацию "⏳ Генерируем..." в виде точек.
+    Возвращает tuple: (msg, stop_animation)
+    """
+    msg = await message.answer(f"{text}.")
+    running = True
+
+    async def animate():
+        dots = 1
+        while running:
+            await asyncio.sleep(delay)
+            dots = (dots % 3) + 1
+            try:
+                await msg.edit_text(f"{text}{'.' * dots}")
+            except Exception:
+                break
+
+    task = asyncio.create_task(animate())
+
+    def stop():
+        nonlocal running
+        running = False
+        task.cancel()
+
+    return msg, stop
 
 
 def _format_prompt_message(prompts: List[str]) -> str:
@@ -263,13 +293,24 @@ async def generate_from_text(message: Message, command: CommandObject):
         )
         return
 
-    reference_urls = [photo_url]
-    result = await _perform_generation(prompt, reference_urls=reference_urls)
-    if not result:
-        await message.answer("Не получилось сгенерировать изображение, попробуй позже.")
-        return
+    
+    wait_msg, stop_animation = await start_loading_animation(message, "🎨 Генерируем изображение")
 
-    await _send_generation(message, result, caption=f"Готово! 🎨\n\n{prompt}")
+    try:
+        result = await _perform_generation(prompt, reference_urls=[photo_url])
+        if not result:
+            await wait_msg.edit_text("❌ Не удалось сгенерировать изображение, попробуй позже.")
+            return
+
+        # Останавливаем анимацию
+        stop_animation()
+        await wait_msg.delete()
+
+        await _send_generation(message, result, caption=f"Готово! 🎨\n\n{prompt}")
+
+    except Exception as e:
+        stop_animation()
+        await wait_msg.edit_text(f"⚠️ Ошибка: {e}")
 
 
 @router.message(Command("gen_photo"))
@@ -323,13 +364,21 @@ async def handle_post(message: Message, state: FSMContext):
         return
 
     normalized = normalize_text(message.text)
+
+    # 🌀 Запускаем анимацию "Думаем над промптами..."
+    wait_msg, stop_animation = await start_loading_animation(message, "💭 Думаем над промптами")
+
     prompts: List[str] = []
     try:
-        logger.info('trying to generate from models')
+        logger.info("trying to generate from models")
         prompts = await prompt_service.generate(normalized, PROMPT_SUGGESTION_COUNT)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Prompt generation failed: %s", exc)
         prompts = generate_prompt_suggestions(normalized)[:PROMPT_SUGGESTION_COUNT]
+    finally:
+        # 🧹 Всегда останавливаем анимацию, даже при ошибке
+        stop_animation()
+        await wait_msg.delete()
 
     if not prompts:
         await message.answer("Не удалось составить варианты промптов, попробуй другой текст.")
@@ -356,8 +405,10 @@ async def handle_post(message: Message, state: FSMContext):
 async def handle_prompt_choice(
     callback: CallbackQuery,
     callback_data: PromptChoiceCallback,
-    state: FSMContext,
-):
+    state: FSMContext,  
+):  
+    
+    logger.info('Inside handle_prompt_choice')
     if not callback.from_user:
         await callback.answer("Не распознали пользователя", show_alert=True)
         return
@@ -372,6 +423,7 @@ async def handle_prompt_choice(
     prompt = prompts[callback_data.index]
     await callback.answer("Генерируем…", show_alert=False)
 
+    logger.info(f"Selected prompt {prompt}")
     async with SessionLocal() as session:
         user = await ensure_user(session, callback.from_user.id)
         photo_url = user.photo_url
@@ -382,13 +434,26 @@ async def handle_prompt_choice(
         await callback.answer()
         return
 
-    reference_urls = [photo_url]
-    result = await _perform_generation(prompt, reference_urls=reference_urls)
-    if not result:
-        await callback.message.answer("Не удалось сгенерировать картинку, попробуй снова.")
-        return
+    logger.info(f"Using photo_url {photo_url}")
+    # 🌀 Показываем сообщение-анимацию
+    wait_msg, stop_animation = await start_loading_animation(callback.message, "🎨 Генерируем изображение")
 
-    await _send_generation(callback.message, result, caption=f"Результат по промпту:\n\n{prompt}")
+    reference_urls = [photo_url]
+    try:
+        result = await _perform_generation(prompt, reference_urls=reference_urls)
+        if not result:
+            await wait_msg.edit_text("❌ Не удалось сгенерировать картинку, попробуй снова.")
+            return
+
+        # Останавливаем и убираем анимацию
+        stop_animation()
+        await wait_msg.delete()
+
+        await _send_generation(callback.message, result, caption=f"Результат по промпту:\n\n{prompt}")
+
+    except Exception as e:
+        stop_animation()
+        await wait_msg.edit_text(f"⚠️ Ошибка: {e}")
 
 
 @router.callback_query(PromptRegenCallback.filter())

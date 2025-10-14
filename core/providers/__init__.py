@@ -33,7 +33,7 @@ def init_image_providers(
 def init_prompt_providers(
     comet_api_key: str | None,
     openrouter_api_key: str | None,
-    comet_base_url: str = "https://api.cometapi.com/v1beta",
+    comet_base_url: str = "https://api.cometapi.com/v1",
     openrouter_base_url: str = "https://openrouter.ai/api/v1",
     prompt_model: str = "google/gemini-2.0-flash-exp",
 ) -> List[BasePromptProvider]:

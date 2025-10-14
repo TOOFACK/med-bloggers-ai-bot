@@ -189,8 +189,8 @@ class CometPromptProvider(BasePromptProvider):
     def __init__(
         self,
         api_key: str,
-        base_url: str = "https://api.cometapi.com/v1beta",
-        model: str = "models/gemini-2.0-flash:generateContent",
+        base_url: str = "https://api.cometapi.com/v1",
+        model: str = "gemini-2.0-flash",
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
@@ -198,41 +198,39 @@ class CometPromptProvider(BasePromptProvider):
 
     async def generate_prompts(self, text: str, count: int) -> List[str]:
         headers = {
-            "Authorization": self.api_key,
+            "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        url = f"{self.base_url}/{self.model}"
+        url = f"{self.base_url}/chat/completions"
         instruction = (
-            "Сгенерируй {count} креативных промптов для генерации изображений на основе следующего текста. "
-            "Ответ верни в формате JSON списка строк без дополнительных комментариев. Сделай промпты на русском языке"
+            "Сформируй {count} коротких промптов для генерации изображений на русском языке, "
+            "используя следующий контекст. Верни результат в виде JSON-массива строк."
         ).format(count=count)
 
         logger.info(f"use Comet with model {self.model} with prompt {instruction}")
         payload = {
-            "contents": [
-                {
-                    "role": "system",
-                    "parts": [{"text": instruction}],
-                },
-                {
-                    "role": "user",
-                    "parts": [{"text": text}],
-                },
-            ]
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": instruction},
+                {"role": "user", "content": text},
+            ],
+            "temperature": 0.9,
         }
 
-        raw_text = ""
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload, headers=headers) as resp:
                 if resp.status != 200:
                     details = await resp.text()
                     raise RuntimeError(f"CometPromptProvider error {resp.status}: {details}")
+
                 result = await resp.json()
                 try:
-                    raw_text = result["candidates"][0]["content"]["parts"][0]["text"]
-                    logger.info(f"Comet return {raw_text}")
-                except (KeyError, IndexError) as exc:
+                    raw_text = result["choices"][0]["message"]["content"].strip()
+                    logger.info(f"Comet returned (first 200 chars): {raw_text[:200]}")
+                except (KeyError, IndexError, TypeError) as exc:
                     raise RuntimeError(f"CometPromptProvider invalid response: {result}") from exc
+
+        logger.info(f"Parse text from API {raw_text}")
         return _normalize_prompt_list(raw_text, count)
 
 
@@ -241,7 +239,7 @@ class OpenRouterPromptProvider(BasePromptProvider):
         self,
         api_key: str,
         base_url: str = "https://openrouter.ai/api/v1",
-        model: str = "google/gemini-2.0-flash-exp",
+        model: str = "google/gemini-2.0-flash",
     ):
         self.client = OpenAI(base_url=base_url, api_key=api_key)
         self.model = model
