@@ -23,7 +23,9 @@ def truncate_for_button(text: str, limit: int = 48) -> str:
     return text[: limit - 1] + "…"
 
 
-def generate_prompt_suggestions(text: str, patterns: tuple[str, ...] = DEFAULT_SUGGESTION_PATTERNS) -> List[str]:
+def generate_prompt_suggestions(
+    text: str, patterns: tuple[str, ...] = DEFAULT_SUGGESTION_PATTERNS
+) -> List[str]:
     subject = normalize_text(text)
     if not subject:
         return []
@@ -45,7 +47,9 @@ async def fetch_file_bytes(bot: Bot, file_id: str) -> Tuple[bytes, str]:
     return destination.getvalue(), filename
 
 
-def input_file_from_base64(data: str, filename: str = "generation.jpg") -> BufferedInputFile:
+def input_file_from_base64(
+    data: str, filename: str = "generation.jpg"
+) -> BufferedInputFile:
     header, _, body = data.partition(",")
     if _ and "base64" in header.lower():
         data = body

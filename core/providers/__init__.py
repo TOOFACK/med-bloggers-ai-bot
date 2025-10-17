@@ -1,6 +1,6 @@
 from typing import List
 
-from .base import BaseProvider, BasePromptProvider
+from .base import BasePromptProvider, BaseProvider
 from .providers import (
     CometPromptProvider,
     CometProvider,

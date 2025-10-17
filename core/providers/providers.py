@@ -1,15 +1,16 @@
 import asyncio
 import base64
 import json
-from typing import Optional, Dict, Any, List, Sequence
+import logging
+from typing import Any, Dict, List, Optional, Sequence
 
 import aiohttp
 from openai import OpenAI
 
-from .base import BaseProvider, BasePromptProvider
-import logging
+from .base import BasePromptProvider, BaseProvider
 
-logger = logging.getLogger(__name__) 
+logger = logging.getLogger(__name__)
+
 
 class CometProvider(BaseProvider):
     def __init__(self, api_key: str, base_url: str = "https://api.cometapi.com/v1beta"):
@@ -48,14 +49,20 @@ class CometProvider(BaseProvider):
                 result = await resp.json()
                 img_b64 = _extract_comet_base64(result)
                 if not img_b64:
-                    raise RuntimeError(f"CometProvider invalid response: {json.dumps(result)[:400]}")
+                    raise RuntimeError(
+                        f"CometProvider invalid response: {json.dumps(result)[:400]}"
+                    )
                 return {"type": "base64", "data": img_b64, "provider": self.name}
 
-    async def _image_url_to_inline(self, session: aiohttp.ClientSession, image_url: str) -> Optional[Dict[str, Any]]:
+    async def _image_url_to_inline(
+        self, session: aiohttp.ClientSession, image_url: str
+    ) -> Optional[Dict[str, Any]]:
         async with session.get(image_url) as response:
             if response.status != 200:
                 return None
             mime = response.headers.get("Content-Type", "image/jpeg")
+            if mime in ("application/octet-stream", None, ""):
+                mime = "image/jpeg"  # 🔧 исправляем некорректный MIME из Telegram
             raw = await response.read()
             encoded = base64.b64encode(raw).decode("utf-8")
             return {"mime_type": mime, "data": encoded}
@@ -84,7 +91,9 @@ class OpenRouterProvider(BaseProvider):
             }
         ]
         for image_url in reference_urls or []:
-            messages[0]["content"].append({"type": "image_url", "image_url": {"url": image_url}})
+            messages[0]["content"].append(
+                {"type": "image_url", "image_url": {"url": image_url}}
+            )
 
         loop = asyncio.get_running_loop()
         completion = await loop.run_in_executor(
@@ -221,14 +230,18 @@ class CometPromptProvider(BasePromptProvider):
             async with session.post(url, json=payload, headers=headers) as resp:
                 if resp.status != 200:
                     details = await resp.text()
-                    raise RuntimeError(f"CometPromptProvider error {resp.status}: {details}")
+                    raise RuntimeError(
+                        f"CometPromptProvider error {resp.status}: {details}"
+                    )
 
                 result = await resp.json()
                 try:
                     raw_text = result["choices"][0]["message"]["content"].strip()
                     logger.info(f"Comet returned (first 200 chars): {raw_text[:200]}")
                 except (KeyError, IndexError, TypeError) as exc:
-                    raise RuntimeError(f"CometPromptProvider invalid response: {result}") from exc
+                    raise RuntimeError(
+                        f"CometPromptProvider invalid response: {result}"
+                    ) from exc
 
         logger.info(f"Parse text from API {raw_text}")
         return _normalize_prompt_list(raw_text, count)
@@ -302,7 +315,9 @@ def _normalize_prompt_list(raw_text: str, expected_count: int) -> List[str]:
         separators = ["\n", ";"]
         for sep in separators:
             if sep in raw_text:
-                prompts = [part.strip(" •\t") for part in raw_text.split(sep) if part.strip()]
+                prompts = [
+                    part.strip(" •\t") for part in raw_text.split(sep) if part.strip()
+                ]
                 break
         if not prompts and raw_text:
             prompts = [raw_text]

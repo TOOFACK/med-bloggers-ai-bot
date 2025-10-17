@@ -14,7 +14,9 @@ class PromptRegenCallback(CallbackData, prefix="regen"):
     message_id: int
 
 
-def prompt_suggestions_keyboard(message_id: int, prompts: list[str]) -> InlineKeyboardMarkup:
+def prompt_suggestions_keyboard(
+    message_id: int, prompts: list[str]
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for idx, prompt in enumerate(prompts):
         builder.button(

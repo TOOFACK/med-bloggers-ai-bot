@@ -59,7 +59,9 @@ def build_public_url(object_key: str) -> str:
     return f"https://{bucket}.s3{region_part}.amazonaws.com/{object_key}"
 
 
-async def upload_bytes(data: bytes, filename: str, user_id: str | int) -> Tuple[str, str]:
+async def upload_bytes(
+    data: bytes, filename: str, user_id: str | int
+) -> Tuple[str, str]:
     bucket = _require_bucket()
     object_key = _build_object_key(filename, user_id)
     content_type, _ = mimetypes.guess_type(filename)
