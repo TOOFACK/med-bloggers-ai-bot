@@ -3,9 +3,9 @@ services:
     image: postgres:15
     restart: always
     environment:
-      POSTGRES_USER: bot
-      POSTGRES_PASSWORD: bot
-      POSTGRES_DB: botdb
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     ports:
       - "5432:5432"
     volumes:
@@ -25,7 +25,7 @@ services:
     command: >
       bash -c "./wait-for-db.sh && alembic upgrade head"
     environment:
-      DATABASE_URL: postgresql+psycopg2://bot:bot@db:5432/botdb
+      DATABASE_URL: ${DB_URL}
     volumes:
       - .:/app
     restart: "no"
