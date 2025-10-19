@@ -15,7 +15,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U bot -d botdb -h localhost"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB} -h localhost"]
       interval: 3s
       timeout: 3s
       retries: 5
@@ -23,8 +23,7 @@ services:
   migrate:
     build: .
     depends_on:
-      db:
-        condition: service_healthy
+      - db
     env_file:
       - .env
     command: >
@@ -36,8 +35,7 @@ services:
   bot:
     build: .
     depends_on:
-      migrate:
-        condition: service_completed_successfully
+      - migrate
     env_file:
       - .env
     command: python app.py
