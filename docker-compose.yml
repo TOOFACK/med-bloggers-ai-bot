@@ -37,7 +37,7 @@ services:
         condition: service_completed_successfully
     command: python app.py
     environment:
-      DATABASE_URL: postgresql+asyncpg://bot:bot@db:5432/botdb
+      DATABASE_URL: ${DB_URL}
     ports:
       - "8080:8080"
     restart: always
