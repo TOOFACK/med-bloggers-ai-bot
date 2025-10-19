@@ -1,7 +1,11 @@
+version: "3.8"
+
 services:
   db:
     image: postgres:15
     restart: always
+    env_file:
+      - .env
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -16,28 +20,27 @@ services:
       timeout: 3s
       retries: 5
 
-
   migrate:
     build: .
     depends_on:
       db:
         condition: service_healthy
+    env_file:
+      - .env
     command: >
       bash -c "./wait-for-db.sh && alembic upgrade head"
-    environment:
-      DATABASE_URL: ${DB_URL}
+    restart: "no"
     volumes:
       - .:/app
-    restart: "no"
 
   bot:
     build: .
     depends_on:
       migrate:
         condition: service_completed_successfully
+    env_file:
+      - .env
     command: python app.py
-    environment:
-      DATABASE_URL: ${DB_URL}
     ports:
       - "8080:8080"
     restart: always
@@ -46,4 +49,3 @@ services:
 
 volumes:
   pgdata:
-

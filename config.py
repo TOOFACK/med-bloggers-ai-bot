@@ -8,7 +8,8 @@ API_TOKEN = os.getenv("TELEGRAM_API_TOKEN")
 WEBHOOK_PATH = f"/bot/{API_TOKEN}"
 APP_HOST = "0.0.0.0"
 APP_PORT = 8080
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "") + WEBHOOK_PATH
+WEBHOOK_BASE = os.getenv("WEBHOOK_URL", "")
+WEBHOOK_URL = WEBHOOK_BASE + WEBHOOK_PATH
 
 DEV_MODE = os.getenv("DEV_MODE", "webhook").lower()
 
