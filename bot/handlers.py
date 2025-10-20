@@ -167,6 +167,8 @@ async def _send_generation(message: Message, result: Dict[str, Any], caption: st
     footer = f"\n\nИсточник: {provider}" if provider else ""
     full_caption = f"{caption}{footer}"
 
+    if len(full_caption) > 128:
+        full_caption = full_caption[:128] + "…"
     output_type = result.get("type")
     data = result.get("data")
 
