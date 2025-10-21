@@ -36,7 +36,8 @@ from .keyboards import (
     PromptRegenCallback,
     prompt_suggestions_keyboard,
 )
-
+ 
+from .notifications.salebot import SaleBotClient
 logger = logging.getLogger(__name__)
 
 for noisy in ["sqlalchemy.engine", "alembic", "aiogram.event"]:
@@ -69,7 +70,7 @@ if not prompt_providers:
 
 model_service = ModelService(image_providers)
 prompt_service = PromptService(prompt_providers)
-
+sale_client = SaleBotClient()
 
 async def start_loading_animation(
     message: types.Message, text="⏳ Генерируем", delay=0.5
@@ -138,6 +139,9 @@ async def _collect_telegram_image_urls(
                 urls.append(url)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to fetch reference photo URL: %s", exc)
+        sale_client.send_error_message(
+            error_text=str(exc),
+            error_place="_collect_telegram_image_urls")
     return urls
 
 
@@ -147,6 +151,9 @@ async def _commit_session(session):
     except SQLAlchemyError as exc:
         await session.rollback()
         logger.exception("DB error: %s", exc)
+        sale_client.send_error_message(
+            error_text=str(exc),
+            error_place="_commit_session")
         raise
 
 
@@ -159,6 +166,11 @@ async def _perform_generation(
         return await model_service.generate_from_text(prompt)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Generation failed: %s", exc)
+
+        sale_client.send_error_message(
+            error_text=str(exc),
+            error_place="model_service.generate_with_reference or model_service.generate_from_text")
+        
         return None
 
 
@@ -190,6 +202,12 @@ async def _send_generation(message: Message, result: Dict[str, Any], caption: st
                 return
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Failed to send image by URL: %s", exc)
+
+                sale_client.send_error_message(
+                    error_text=str(exc),
+                    error_place="_send_generation.url_candidate.message.answer_photo(url_candidate, caption=full_caption)")
+        
+        # TODO: resend if so or any other logic
         await message.answer(
             "Провайдер не вернул ссылку на изображение. Текст ответа:\n"
             f"<code>{html.escape(str(data))}</code>"
@@ -201,12 +219,19 @@ async def _send_generation(message: Message, result: Dict[str, Any], caption: st
             photo_file = input_file_from_base64(data)
         except ValueError as exc:
             logger.exception("Base64 decode failed: %s", exc)
+
+            sale_client.send_error_message(
+                error_text=str(exc),
+                error_place="_send_generation.output_type.base64.input_file_from_base64(data)")
+            
             await message.answer("Ошибка обработки изображения. Попробуйте снова.")
+            
             return
         await message.answer_photo(photo_file, caption=full_caption)
         return
 
     if output_type == "text":
+        # TODO: retry logic until image
         await message.answer(
             "Провайдер вернул текст вместо изображения:\n"
             f"<code>{html.escape(str(data))}</code>"
@@ -265,6 +290,9 @@ async def save_photo(message: Message, bot: Bot):
     except Exception as exc:  # noqa: BLE001
         logger.exception("Failed to download photo: %s", exc)
         await message.answer("Не получилось скачать фото, попробуй ещё раз.")
+        sale_client.send_error_message(
+            error_text=str(exc),
+            error_place="save_photo.fetch_file_bytes(bot, photo.file_id)")
         return
 
     async with SessionLocal() as session:
@@ -285,6 +313,9 @@ async def save_photo(message: Message, bot: Bot):
         except Exception as exc:  # noqa: BLE001
             logger.exception("S3 upload failed: %s", exc)
             await message.answer("Не удалось сохранить фото, попробуй позже.")
+            sale_client.send_error_message(
+                error_text=str(exc),
+                error_place="save_photo.upload_bytes(file_bytes, filename, message.from_user.id)")
             return
 
         await set_user_photo(session, user, url, object_key)
@@ -295,6 +326,9 @@ async def save_photo(message: Message, bot: Bot):
             await delete_object(old_object_key)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to delete old S3 object %s: %s", old_object_key, exc)
+            sale_client.send_error_message(
+                error_text=str(exc),
+                error_place="save_photo.delete_object(old_object_key)")
 
     await message.answer(
         "Фото обновлено! Используй <code>/gen &lt;описание&gt;</code> для генераций с учётом снимка."
@@ -412,6 +446,10 @@ async def handle_post(message: Message, state: FSMContext):
         prompts = await prompt_service.generate(normalized, PROMPT_SUGGESTION_COUNT)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Prompt generation failed: %s", exc)
+        sale_client.send_error_message(
+            error_text=str(exc),
+            error_place="handle_post.prompt_service.generate(normalized, PROMPT_SUGGESTION_COUNT)")
+        
         prompts = generate_prompt_suggestions(normalized)[:PROMPT_SUGGESTION_COUNT]
     finally:
         # 🧹 Всегда останавливаем анимацию, даже при ошибке
@@ -503,6 +541,9 @@ async def handle_prompt_choice(
 
     except Exception as e:
         stop_animation()
+        sale_client.send_error_message(
+            error_text=str(e),
+            error_place="handle_prompt_choice._perform_generation(prompt, reference_urls=reference_urls) or _send_generation")
         await wait_msg.edit_text(f"⚠️ Ошибка: {e}")
 
 
@@ -532,6 +573,9 @@ async def handle_prompt_regenerate(
         prompts = await prompt_service.generate(base_text, PROMPT_SUGGESTION_COUNT)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Prompt regenerate failed: %s", exc)
+        sale_client.send_error_message(
+            error_text=str(exc),
+            error_place="handle_prompt_regenerate.prompt_service.generate(base_text, PROMPT_SUGGESTION_COUNT)")
         prompts = generate_prompt_suggestions(base_text)[:PROMPT_SUGGESTION_COUNT]
 
     if not prompts:
@@ -557,6 +601,9 @@ async def handle_prompt_regenerate(
             reply_markup=prompt_suggestions_keyboard(callback_data.message_id, prompts),
             disable_web_page_preview=True,
         )
+        sale_client.send_error_message(
+            error_text=str(exc),
+            error_place="handle_prompt_regenerate.callback.message.edit_text")
 
     await callback.answer("Готово!")
 
@@ -581,6 +628,9 @@ async def handle_iterative_edit(message: Message, bot: Bot):
     except Exception as exc:
         logger.error(f"Не удалось получить фото из сообщения: {exc}")
         await message.answer("❌ Не удалось загрузить фото для правок.")
+        sale_client.send_error_message(
+            error_text=str(exc),
+            error_place="handle_iterative_edit")
         return
 
     # Запускаем анимацию "генерация"
@@ -608,6 +658,9 @@ async def handle_iterative_edit(message: Message, bot: Bot):
     except Exception as exc:
         stop_animation()
         await wait_msg.edit_text(f"⚠️ Ошибка при генерации: {exc}")
+        sale_client.send_error_message(
+            error_text=str(exc),
+            error_place="handle_iterative_edit._perform_generation")
 
 
 @router.message(Command("free_gen"))
@@ -647,3 +700,6 @@ async def generate_without_base(message: Message, command: CommandObject):
     except Exception as e:
         stop_animation()
         await wait_msg.edit_text(f"⚠️ Ошибка: {e}")
+        sale_client.send_error_message(
+            error_text=str(e),
+            error_place="generate_without_base._perform_generation")
