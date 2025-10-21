@@ -7,3 +7,4 @@ openai
 aioboto3
 python-dotenv
 psycopg2-binary
+requests

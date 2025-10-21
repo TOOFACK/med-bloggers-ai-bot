@@ -5,18 +5,20 @@ from dotenv import load_dotenv
 load_dotenv()
 
 API_TOKEN = os.getenv("TELEGRAM_API_TOKEN")
+API_TOKEN_LOCAL = os.getenv("TELEGRAM_API_TOKEN_LOCAL")
 WEBHOOK_PATH = f"/bot/{API_TOKEN}"
 APP_HOST = "0.0.0.0"
 APP_PORT = 8080
 WEBHOOK_BASE = os.getenv("WEBHOOK_URL", "")
 WEBHOOK_URL = WEBHOOK_BASE + WEBHOOK_PATH
 
+BOT_MODE = os.getenv("BOT_MODE", "test").lower()
 DEV_MODE = os.getenv("DEV_MODE", "webhook").lower()
 
 
 DB_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://bot:bot@db:5432/botdb")
 
-PROMPT_SUGGESTION_COUNT = int(os.getenv("PROMPT_SUGGESTION_COUNT", "3"))
+# PROMPT_SUGGESTION_COUNT = int(os.getenv("PROMPT_SUGGESTION_COUNT", "3"))
 
 COMET_API_KEY = os.getenv("COMET_API_KEY")
 COMET_BASE_URL = os.getenv("COMET_BASE_URL", "https://api.cometapi.com/v1beta")

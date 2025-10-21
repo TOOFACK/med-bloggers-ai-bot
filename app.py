@@ -7,14 +7,21 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 
-from config import API_TOKEN, APP_HOST, APP_PORT, DEV_MODE, WEBHOOK_PATH, WEBHOOK_URL
+from config import API_TOKEN, APP_HOST, APP_PORT, DEV_MODE, WEBHOOK_PATH, WEBHOOK_URL, BOT_MODE, API_TOKEN_LOCAL
 
 logging.basicConfig(level=logging.INFO)
 
-bot = Bot(
-    token=API_TOKEN,
-    default=DefaultBotProperties(parse_mode="HTML"),
-)
+
+if BOT_MODE == "test":
+    bot = Bot(
+        token=API_TOKEN_LOCAL,
+        default=DefaultBotProperties(parse_mode="HTML"),
+    )
+else:
+    bot = Bot(
+        token=API_TOKEN,
+        default=DefaultBotProperties(parse_mode="HTML"),
+    )
 dp = Dispatcher(storage=MemoryStorage())
 
 from bot.router import router as bot_router

@@ -73,7 +73,7 @@ class OpenRouterProvider(BaseProvider):
         self,
         api_key: str,
         base_url: str = "https://openrouter.ai/api/v1",
-        model: str = "google/gemini-2.5-flash-image-preview",
+        model: str = "google/gemini-2.5-flash-image",
     ):
         self.client = OpenAI(base_url=base_url, api_key=api_key)
         self.model = model
@@ -101,6 +101,7 @@ class OpenRouterProvider(BaseProvider):
             lambda: self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
+                modalities=["image", "text"],  # ✅ добавляем сюда
             ),
         )
 
@@ -127,21 +128,40 @@ def _extract_comet_base64(payload: Dict[str, Any]) -> Optional[str]:
 
 
 def _extract_openrouter_payload(completion: Any) -> Dict[str, Any]:
+    """
+    Универсальный парсер ответа от OpenRouter / Gemini / Comet.
+    Возвращает {"type": "base64"|"url"|"text", "data": ...}
+    """
+
     choice = completion.choices[0]
     message = getattr(choice, "message", None)
 
     if message is None:
         return {"type": "text", "data": str(choice)}
 
+    # ---- Универсальное извлечение контента ----
     raw_content = getattr(message, "content", None)
     if hasattr(message, "model_dump"):
         message_dict = message.model_dump()
         raw_content = message_dict.get("content", raw_content)
 
-    images_base64: List[str] = []
-    image_urls: List[str] = []
-    texts: List[str] = []
+    images_base64: list[str] = []
+    image_urls: list[str] = []
+    texts: list[str] = []
 
+    # ✅ 1. OpenRouter / Gemini формат с message["images"]
+    if hasattr(message, "images") and message.images:
+        for img in message.images:
+            img_url = img.get("image_url", {}).get("url")
+            if img_url:
+                if img_url.startswith("data:image"):
+                    # data:image/png;base64,...
+                    b64 = img_url.split("base64,")[-1]
+                    images_base64.append(b64)
+                else:
+                    image_urls.append(img_url)
+
+    # ✅ 2. OpenAI-style content = list of parts
     def _collect_from_item(item: Any) -> None:
         if not isinstance(item, dict):
             if isinstance(item, str):
@@ -186,12 +206,14 @@ def _extract_openrouter_payload(completion: Any) -> Dict[str, Any]:
     elif raw_content is not None:
         _collect_from_item(raw_content)  # type: ignore[arg-type]
 
+    # ✅ 3. Собираем итог
     if images_base64:
         return {"type": "base64", "data": images_base64[0]}
     if image_urls:
         return {"type": "url", "data": image_urls[0]}
     joined_text = "\n".join(texts).strip()
     return {"type": "text", "data": joined_text or ""}
+
 
 
 class CometPromptProvider(BasePromptProvider):
@@ -205,16 +227,12 @@ class CometPromptProvider(BasePromptProvider):
         self.base_url = base_url.rstrip("/")
         self.model = model
 
-    async def generate_prompts(self, text: str, count: int) -> List[str]:
+    async def generate_prompts(self, text: str, count: int, instruction: str) -> List[str]:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
         url = f"{self.base_url}/chat/completions"
-        instruction = (
-            "Сформируй {count} коротких промптов для генерации изображений на русском языке, "
-            "используя следующий контекст. Верни результат в виде JSON-массива строк."
-        ).format(count=count)
 
         logger.info(f"use Comet with model {self.model} with prompt {instruction}")
         payload = {
@@ -257,11 +275,7 @@ class OpenRouterPromptProvider(BasePromptProvider):
         self.client = OpenAI(base_url=base_url, api_key=api_key)
         self.model = model
 
-    async def generate_prompts(self, text: str, count: int) -> List[str]:
-        prompt = (
-            "Сформируй {count} коротких промптов для генерации изображений на русском языке, "
-            "используя следующий контекст. Верни результат в виде JSON-массива строк."
-        ).format(count=count)
+    async def generate_prompts(self, text: str, count: int ,instruction: str) -> List[str]:
 
         loop = asyncio.get_running_loop()
         completion = await loop.run_in_executor(
@@ -269,7 +283,7 @@ class OpenRouterPromptProvider(BasePromptProvider):
             lambda: self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": prompt},
+                    {"role": "system", "content": instruction},
                     {"role": "user", "content": text},
                 ],
             ),

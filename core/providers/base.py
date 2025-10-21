@@ -40,5 +40,5 @@ class BasePromptProvider(ABC):
         return self.__class__.__name__
 
     @abstractmethod
-    async def generate_prompts(self, text: str, count: int) -> List[str]:
+    async def generate_prompts(self, text: str, count: int, instruction: str) -> List[str]:
         pass

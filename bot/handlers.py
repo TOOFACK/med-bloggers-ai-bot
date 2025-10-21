@@ -15,8 +15,7 @@ from config import (
     COMET_BASE_URL,
     OPENROUTER_API_KEY,
     OPENROUTER_BASE_URL,
-    PROMPT_MODEL,
-    PROMPT_SUGGESTION_COUNT,
+    PROMPT_MODEL
 )
 from core.db import SessionLocal
 from core.providers import init_image_providers, init_prompt_providers
@@ -35,8 +34,12 @@ from .keyboards import (
     PromptChoiceCallback,
     PromptRegenCallback,
     prompt_suggestions_keyboard,
+    prompt_mode_keyboard,
+    PromptModeCallback
 )
- 
+
+from .constants import PROMPT_SUGGESTION_COUNT, SYSTEM_PROMPT_FOR_EDIT, SYSTEM_PROMPT_FOR_CREATING
+
 from .notifications.salebot import SaleBotClient
 logger = logging.getLogger(__name__)
 
@@ -428,54 +431,16 @@ async def generate_with_photo(message: Message, command: CommandObject, bot: Bot
 
 @router.message(F.text & ~F.via_bot & ~F.text.startswith("/") & ~F.reply_to_message)
 async def handle_post(message: Message, state: FSMContext):
-
     logger.info("starting promts from message")
     if not message.from_user or not message.text:
         return
 
     normalized = normalize_text(message.text)
-
-    # 🌀 Запускаем анимацию "Думаем над промптами..."
-    wait_msg, stop_animation = await start_loading_animation(
-        message, "💭 Думаем над промптами"
-    )
-
-    prompts: List[str] = []
-    try:
-        logger.info("trying to generate from models")
-        prompts = await prompt_service.generate(normalized, PROMPT_SUGGESTION_COUNT)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Prompt generation failed: %s", exc)
-        sale_client.send_error_message(
-            error_text=str(exc),
-            error_place="handle_post.prompt_service.generate(normalized, PROMPT_SUGGESTION_COUNT)")
-        
-        prompts = generate_prompt_suggestions(normalized)[:PROMPT_SUGGESTION_COUNT]
-    finally:
-        # 🧹 Всегда останавливаем анимацию, даже при ошибке
-        stop_animation()
-        await wait_msg.delete()
-
-    if not prompts:
-        await message.answer(
-            "Не удалось составить варианты промптов, попробуй другой текст."
-        )
-        return
-
-    state_data = await state.get_data()
-    prompt_sets: Dict[str, List[str]] = state_data.get("prompt_sets", {})
-    prompt_sources: Dict[str, str] = state_data.get("prompt_sources", {})
-
-    prompt_sets[str(message.message_id)] = prompts
-    prompt_sources[str(message.message_id)] = normalized
-    prompt_sets = _prune_map(prompt_sets)
-    prompt_sources = _prune_map(prompt_sources)
-    await state.update_data(prompt_sets=prompt_sets, prompt_sources=prompt_sources)
+    await state.update_data(base_text=normalized)
 
     await message.answer(
-        _format_prompt_message(prompts),
-        reply_markup=prompt_suggestions_keyboard(message.message_id, prompts),
-        disable_web_page_preview=True,
+        "Выбери, какие промпты сгенерировать:",
+        reply_markup=prompt_mode_keyboard(),
     )
 
 
@@ -485,7 +450,6 @@ async def handle_prompt_choice(
     callback_data: PromptChoiceCallback,
     state: FSMContext,
 ):
-
     logger.info("Inside handle_prompt_choice")
     if not callback.from_user:
         await callback.answer("Не распознали пользователя", show_alert=True)
@@ -501,110 +465,92 @@ async def handle_prompt_choice(
         return
 
     prompt = prompts[callback_data.index]
+    mode = state_data.get("prompt_mode", "edit")  # <- сохраняли при выборе стиля
     await callback.answer("Генерируем…", show_alert=False)
 
-    logger.info(f"Selected prompt {prompt}")
+    logger.info(f"Selected prompt {prompt} (mode={mode})")
+
     async with SessionLocal() as session:
         user = await ensure_user(session, callback.from_user.id)
         photo_url = user.photo_url
         await _commit_session(session)
 
-    if not photo_url:
-        await callback.message.answer(
-            "Сначала отправь фото, чтобы мы могли использовать его для генерации."
-        )
-        await callback.answer()
-        return
-
-    logger.info(f"Using photo_url {photo_url}")
-    # 🌀 Показываем сообщение-анимацию
+    # 🌀 Анимация
     wait_msg, stop_animation = await start_loading_animation(
         callback.message, "🎨 Генерируем изображение"
     )
 
-    reference_urls = [photo_url]
     try:
-        result = await _perform_generation(prompt, reference_urls=reference_urls)
+        if mode == "edit" and photo_url:
+            logger.info(f"Using reference photo: {photo_url}")
+            result = await _perform_generation(prompt, reference_urls=[photo_url])
+        else:
+            logger.info("Generating from text only (no reference)")
+            result = await _perform_generation(prompt)
+
         if not result:
+            stop_animation()
             await wait_msg.edit_text(
                 "❌ Не удалось сгенерировать картинку, попробуй снова."
             )
             return
 
-        # Останавливаем и убираем анимацию
         stop_animation()
         await wait_msg.delete()
 
+        caption_header = (
+            "🪄 Результат редактуры:" if mode == "edit" else "🌄 Новая генерация:"
+        )
         await _send_generation(
-            callback.message, result, caption=f"Результат по промпту:\n\n{prompt}"
+            callback.message,
+            result,
+            caption=f"{caption_header}\n\n{prompt}",
         )
 
     except Exception as e:
         stop_animation()
         sale_client.send_error_message(
             error_text=str(e),
-            error_place="handle_prompt_choice._perform_generation(prompt, reference_urls=reference_urls) or _send_generation")
+            error_place="handle_prompt_choice._perform_generation"
+        )
         await wait_msg.edit_text(f"⚠️ Ошибка: {e}")
 
 
 @router.callback_query(PromptRegenCallback.filter())
-async def handle_prompt_regenerate(
-    callback: CallbackQuery,
-    callback_data: PromptRegenCallback,
-    state: FSMContext,
-):
-    if not callback.from_user:
-        await callback.answer("Не распознали пользователя", show_alert=True)
-        return
-
+async def handle_prompt_regenerate(callback: CallbackQuery, callback_data: PromptRegenCallback, state: FSMContext):
+    mode = callback_data.mode
     state_data = await state.get_data()
     prompt_sources: Dict[str, str] = state_data.get("prompt_sources", {})
-    prompt_sets: Dict[str, List[str]] = state_data.get("prompt_sets", {})
-
     base_text = prompt_sources.get(str(callback_data.message_id))
     if not base_text:
-        await callback.answer(
-            "Не нашли исходный текст, пришли сообщение ещё раз.", show_alert=True
-        )
+        await callback.answer("Не нашли исходный текст, пришли сообщение ещё раз.", show_alert=True)
         return
 
-    prompts: List[str] = []
+    if mode == "edit":
+        instruction = SYSTEM_PROMPT_FOR_EDIT
+    else:
+        instruction = SYSTEM_PROMPT_FOR_CREATING
+
+    wait_msg, stop_animation = await start_loading_animation(callback.message, "♻️ Генерируем новые промпты")
+
     try:
-        prompts = await prompt_service.generate(base_text, PROMPT_SUGGESTION_COUNT)
-    except Exception as exc:  # noqa: BLE001
+        prompts = await prompt_service.generate(
+            text=base_text,
+            count=PROMPT_SUGGESTION_COUNT,
+            instruction=instruction
+        )
+    except Exception as exc:
         logger.warning("Prompt regenerate failed: %s", exc)
-        sale_client.send_error_message(
-            error_text=str(exc),
-            error_place="handle_prompt_regenerate.prompt_service.generate(base_text, PROMPT_SUGGESTION_COUNT)")
         prompts = generate_prompt_suggestions(base_text)[:PROMPT_SUGGESTION_COUNT]
+    finally:
+        stop_animation()
+        await wait_msg.delete()
 
-    if not prompts:
-        await callback.answer("Не удалось придумать новые промпты.", show_alert=True)
-        return
-
-    prompt_sets[str(callback_data.message_id)] = prompts
-    prompt_sets = _prune_map(prompt_sets)
-    await state.update_data(
-        prompt_sets=prompt_sets, prompt_sources=_prune_map(prompt_sources)
+    await callback.message.answer(
+        _format_prompt_message(prompts),
+        reply_markup=prompt_suggestions_keyboard(callback_data.message_id, prompts, mode),
+        disable_web_page_preview=True,
     )
-
-    try:
-        await callback.message.edit_text(
-            _format_prompt_message(prompts),
-            reply_markup=prompt_suggestions_keyboard(callback_data.message_id, prompts),
-            disable_web_page_preview=True,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to edit prompt message: %s", exc)
-        await callback.message.answer(
-            _format_prompt_message(prompts),
-            reply_markup=prompt_suggestions_keyboard(callback_data.message_id, prompts),
-            disable_web_page_preview=True,
-        )
-        sale_client.send_error_message(
-            error_text=str(exc),
-            error_place="handle_prompt_regenerate.callback.message.edit_text")
-
     await callback.answer("Готово!")
 
 
@@ -703,3 +649,52 @@ async def generate_without_base(message: Message, command: CommandObject):
         sale_client.send_error_message(
             error_text=str(e),
             error_place="generate_without_base._perform_generation")
+        
+
+@router.callback_query(PromptModeCallback.filter())
+async def handle_prompt_mode(callback: CallbackQuery, callback_data: PromptModeCallback, state: FSMContext):
+    mode = callback_data.mode  # "edit" or "new"
+    state_data = await state.get_data()
+    base_text = state_data.get("base_text")
+    if not base_text:
+        await callback.answer("Не нашли исходный текст, попробуй снова.", show_alert=True)
+        return
+
+    # Сохраняем текущий режим
+    await state.update_data(prompt_mode=mode)
+
+    # Подбираем инструкцию
+    if mode == "edit":
+        instruction = SYSTEM_PROMPT_FOR_EDIT
+    else:
+        instruction = SYSTEM_PROMPT_FOR_CREATING
+
+    wait_msg, stop_animation = await start_loading_animation(callback.message, "💭 Думаем над промптами")
+
+    try:
+        prompts = await prompt_service.generate(text=base_text, count=PROMPT_SUGGESTION_COUNT, instruction=instruction)
+    except Exception as exc:
+        logger.warning("Prompt generation failed: %s", exc)
+        prompts = generate_prompt_suggestions(base_text)[:PROMPT_SUGGESTION_COUNT]
+    finally:
+        stop_animation()
+        await wait_msg.delete()
+
+    if not prompts:
+        await callback.message.answer("Не удалось составить варианты промптов, попробуй другой текст.")
+        return
+
+    # Сохраняем
+    state_data = await state.get_data()
+    prompt_sets: Dict[str, List[str]] = state_data.get("prompt_sets", {})
+    prompt_sources: Dict[str, str] = state_data.get("prompt_sources", {})
+    prompt_sets[str(callback.message.message_id)] = prompts
+    prompt_sources[str(callback.message.message_id)] = base_text
+    await state.update_data(prompt_sets=_prune_map(prompt_sets), prompt_sources=_prune_map(prompt_sources))
+
+    await callback.message.answer(
+        _format_prompt_message(prompts),
+        reply_markup=prompt_suggestions_keyboard(callback.message.message_id, prompts, mode),
+        disable_web_page_preview=True,
+    )
+    await callback.answer()

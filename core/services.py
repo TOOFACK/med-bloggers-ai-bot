@@ -57,15 +57,15 @@ class PromptService:
     def __init__(self, providers: Sequence[BasePromptProvider]):
         self.providers = list(providers)
 
-    async def generate(self, text: str, count: int) -> List[str]:
+    async def generate(self, text: str, count: int, instruction:str) -> List[str]:
         if not self.providers:
             raise RuntimeError("Нет доступных провайдеров для генерации промптов.")
 
         errors: list[str] = []
         for provider in self.providers:
-            logger.info(f"trying to use {provider} as prompt generator")
+            logger.info(f"trying to use {provider} as prompt generator with instruction {instruction} and text {text}")
             try:
-                prompts = await provider.generate_prompts(text, count)
+                prompts = await provider.generate_prompts(text, count, instruction)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Prompt provider %s failed: %s", provider.name, exc)
                 errors.append(f"{provider.name}: {exc}")
