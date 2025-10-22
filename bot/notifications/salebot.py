@@ -23,7 +23,7 @@ class SaleBotClient:
         data = {
             "error_place": error_place,
             "error_message": error_text,
-            "message": "subscribers_error",
+            "message": "med_bloggers_ai_pavel",
             "client_id": self.admin_chat_id
         }
 
