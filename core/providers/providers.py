@@ -270,7 +270,7 @@ class OpenRouterPromptProvider(BasePromptProvider):
         self,
         api_key: str,
         base_url: str = "https://openrouter.ai/api/v1",
-        model: str = "google/gemini-2.0-flash",
+        model: str = "google/gemini-2.0-flash-001",
     ):
         self.client = OpenAI(base_url=base_url, api_key=api_key)
         self.model = model

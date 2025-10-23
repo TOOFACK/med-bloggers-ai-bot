@@ -43,9 +43,6 @@ from .constants import PROMPT_SUGGESTION_COUNT, SYSTEM_PROMPT_FOR_EDIT, SYSTEM_P
 from .notifications.salebot import SaleBotClient
 logger = logging.getLogger(__name__)
 
-for noisy in ["sqlalchemy.engine", "alembic", "aiogram.event"]:
-    logging.getLogger(noisy).setLevel(logging.WARNING)
-
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
@@ -66,7 +63,6 @@ prompt_providers = init_prompt_providers(
     comet_api_key=COMET_API_KEY,
     openrouter_api_key=OPENROUTER_API_KEY,
     openrouter_base_url=OPENROUTER_BASE_URL,
-    prompt_model=PROMPT_MODEL,
 )
 if not prompt_providers:
     logger.warning("На запуске не найдено ни одного провайдера для генерации промптов.")
@@ -117,35 +113,6 @@ def _prune_map(data: Dict[str, Any], keep: int = 20) -> Dict[str, Any]:
         return data
     keys = sorted(data.keys(), key=int)[-keep:]
     return {key: data[key] for key in keys}
-
-
-async def _collect_telegram_image_urls(
-    bot: Bot, message: Optional[Message]
-) -> List[str]:
-    urls: List[str] = []
-    if not message:
-        return urls
-
-    try:
-        if message.photo:
-            file_id = message.photo[-1].file_id
-            url = await build_file_url(bot, file_id)
-            if url:
-                urls.append(url)
-        if (
-            message.document
-            and message.document.mime_type
-            and message.document.mime_type.startswith("image/")
-        ):
-            url = await build_file_url(bot, message.document.file_id)
-            if url:
-                urls.append(url)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to fetch reference photo URL: %s", exc)
-        sale_client.send_error_message(
-            error_text=str(exc),
-            error_place="_collect_telegram_image_urls")
-    return urls
 
 
 async def _commit_session(session):
@@ -215,6 +182,9 @@ async def _send_generation(message: Message, result: Dict[str, Any], caption: st
             "Провайдер не вернул ссылку на изображение. Текст ответа:\n"
             f"<code>{html.escape(str(data))}</code>"
         )
+        sale_client.send_error_message(
+                error_text=f"Провайдер не вернул ссылку на изображение. Текст ответа:\n<code>{html.escape(str(data))}</code>",
+                error_place="_send_generation.url_candidate.message.answer_photo(url_candidate, caption=full_caption)")
         return
 
     if output_type == "base64":
@@ -236,13 +206,15 @@ async def _send_generation(message: Message, result: Dict[str, Any], caption: st
     if output_type == "text":
         # TODO: retry logic until image
         await message.answer(
-            "Провайдер вернул текст вместо изображения:\n"
-            f"<code>{html.escape(str(data))}</code>"
+            "Не удалось обработать результат генерации. Попробуй еще раз"
         )
+        sale_client.send_error_message(
+                error_text=f"Провайдер не вернул ссылку на изображение. Текст ответа:\n<code>{html.escape(str(data))}</code>",
+                error_place="_send_generation.url_candidate.message.answer_photo(url_candidate, caption=full_caption)")
         return
 
     logger.warning("Unexpected generation payload type: %s", output_type)
-    await message.answer("Не удалось обработать результат генерации.")
+    await message.answer("Не удалось обработать результат генерации. Попробуй еще раз")
 
 
 @router.message(Command("start"))
@@ -257,14 +229,15 @@ async def start(message: Message):
 
     instructions = (
         "🎨 <b>Привет!</b>\n\n"
-        "Я — AI-бот, который помогает создавать и редактировать изображения.\n\n"
+        "Я — AI-бот, который помогает тебе <b>создавать</b> и <b>редактировать изображения</b> по описанию.\n\n"
         "🪄 Что я умею:\n"
         "• Пришли фото — сохраню как базовое.\n"
-        "• <code>/gen</code> — редактирую твоё фото по описанию.\n"
-        "• <code>/free_gen</code> — создам картинку с нуля.\n"
-        "• Просто отправь текст — предложу промпты для генерации.\n"
+        "• <code>/gen</code> + описание — отредактирую твоё фото.\n"
+        "• <code>/free_gen</code> + описание — создам новое изображение с нуля.\n"
+        "• Просто отправь текст (например, пост или идею для видео) — предложу варианты визуализаций. Ты выберешь: с нуля или на основе фото.\n"
         "• Можно редактировать итеративно: просто ответь на картинку и напиши, что поменять.\n\n"
-        "👇 Нажми кнопку, чтобы начать:"
+        "👇 Нажми кнопку, чтобы начать!"
+
     )
 
     keyboard = InlineKeyboardMarkup(
@@ -366,9 +339,11 @@ async def generate_from_text(message: Message, command: CommandObject):
     try:
         result = await _perform_generation(prompt, reference_urls=[photo_url])
         if not result:
-            await wait_msg.edit_text(
+            await message.answer(
                 "❌ Не удалось сгенерировать изображение, попробуй позже."
             )
+            stop_animation()
+            await wait_msg.delete()
             return
 
         # Останавливаем анимацию
@@ -381,52 +356,6 @@ async def generate_from_text(message: Message, command: CommandObject):
         stop_animation()
         await wait_msg.edit_text(f"⚠️ Ошибка: {e}")
 
-
-@router.message(Command("gen_photo"))
-async def generate_with_photo(message: Message, command: CommandObject, bot: Bot):
-    if not message.from_user:
-        await message.answer("Не распознали пользователя.")
-        return
-    prompt = (command.args or "").strip()
-    if not prompt:
-        await message.answer("Добавь описание после команды: `/gen_photo твой промпт`.")
-        return
-
-    async with SessionLocal() as session:
-        user = await ensure_user(session, message.from_user.id)
-        photo_url = user.photo_url
-        await _commit_session(session)
-
-    if not photo_url:
-        await message.answer(
-            "Сначала отправь фото, чтобы мы могли использовать его в генерации."
-        )
-        return
-
-    reference_urls = [photo_url]
-    extra_urls: List[str] = []
-    extra_urls.extend(await _collect_telegram_image_urls(bot, message))
-    if message.reply_to_message:
-        extra_urls.extend(
-            await _collect_telegram_image_urls(bot, message.reply_to_message)
-        )
-
-    for url in extra_urls:
-        if url and url not in reference_urls:
-            reference_urls.append(url)
-
-    if len(reference_urls) == 1:
-        await message.answer(
-            "Добавь референсы: прикрепи фото к команде или отправь команду ответом на сообщение с изображением."
-        )
-        return
-
-    result = await _perform_generation(prompt, reference_urls=reference_urls)
-    if not result:
-        await message.answer("Не получилось сгенерировать изображение, попробуй позже.")
-        return
-
-    await _send_generation(message, result, caption=f"Готово! 🖼\n\n{prompt}")
 
 
 @router.message(F.text & ~F.via_bot & ~F.text.startswith("/") & ~F.reply_to_message)
@@ -490,9 +419,9 @@ async def handle_prompt_choice(
 
         if not result:
             stop_animation()
-            await wait_msg.edit_text(
-                "❌ Не удалось сгенерировать картинку, попробуй снова."
-            )
+            await callback.answer("❌ Не удалось сгенерировать картинку, попробуй снова.", show_alert=False)
+            stop_animation()
+            await wait_msg.delete()
             return
 
         stop_animation()
@@ -589,7 +518,7 @@ async def handle_iterative_edit(message: Message, bot: Bot):
         result = await _perform_generation(message.text, reference_urls=[file_url])
         if not result:
             stop_animation()
-            await wait_msg.edit_text(
+            await message.answer(
                 "❌ Не удалось сгенерировать изображение, попробуй позже."
             )
             return
@@ -633,7 +562,7 @@ async def generate_without_base(message: Message, command: CommandObject):
         result = await _perform_generation(prompt)
         if not result:
             stop_animation()
-            await wait_msg.edit_text(
+            await message.answer(
                 "❌ Не удалось сгенерировать изображение, попробуй позже."
             )
             return
@@ -676,7 +605,12 @@ async def handle_prompt_mode(callback: CallbackQuery, callback_data: PromptModeC
     except Exception as exc:
         logger.warning("Prompt generation failed: %s", exc)
         prompts = generate_prompt_suggestions(base_text)[:PROMPT_SUGGESTION_COUNT]
+        sale_client.send_error_message(
+            error_text=str(exc),
+            error_place="handle_prompt_mode.prompt_service.generate")
+        await callback.message.answer("❌ Не удалось сгенерировать промпты, попробуй позже.")
     finally:
+        
         stop_animation()
         await wait_msg.delete()
 

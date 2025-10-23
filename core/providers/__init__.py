@@ -35,7 +35,6 @@ def init_prompt_providers(
     openrouter_api_key: str | None,
     comet_base_url: str = "https://api.cometapi.com/v1",
     openrouter_base_url: str = "https://openrouter.ai/api/v1",
-    prompt_model: str = "google/gemini-2.0-flash-exp",
 ) -> List[BasePromptProvider]:
     providers: List[BasePromptProvider] = []
     if comet_api_key:
@@ -50,7 +49,6 @@ def init_prompt_providers(
             OpenRouterPromptProvider(
                 api_key=openrouter_api_key,
                 base_url=openrouter_base_url,
-                model=prompt_model,
             )
         )
     return providers
