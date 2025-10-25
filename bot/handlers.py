@@ -21,7 +21,12 @@ from core.db import SessionLocal
 from core.providers import init_image_providers, init_prompt_providers
 from core.s3 import S3ConfigError, delete_object, upload_bytes
 from core.services import ModelService, PromptService
-from core.storage import ensure_user, set_user_photo
+from core.storage import (
+    ensure_user,
+    get_user_photo_urls,
+    set_user_photo,
+    MAX_REFERENCE_PHOTOS,
+)
 from core.utils import (
     build_file_url,
     fetch_file_bytes,
@@ -271,9 +276,11 @@ async def save_photo(message: Message, bot: Bot):
             error_place="save_photo.fetch_file_bytes(bot, photo.file_id)")
         return
 
+    removed_object_keys: List[str] = []
+    reference_urls: List[str] = []
+
     async with SessionLocal() as session:
         user = await ensure_user(session, message.from_user.id)
-        old_object_key = user.photo_object_key
 
         try:
             object_key, url = await upload_bytes(
@@ -294,21 +301,35 @@ async def save_photo(message: Message, bot: Bot):
                 error_place="save_photo.upload_bytes(file_bytes, filename, message.from_user.id)")
             return
 
-        await set_user_photo(session, user, url, object_key)
+        user, removed_object_keys = await set_user_photo(session, user, url, object_key)
+        reference_urls = get_user_photo_urls(user)
         await _commit_session(session)
 
-    if old_object_key and old_object_key != object_key:
+    for stale_key in removed_object_keys:
         try:
-            await delete_object(old_object_key)
+            await delete_object(stale_key)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to delete old S3 object %s: %s", old_object_key, exc)
+            logger.warning(
+                "Failed to delete old S3 object %s: %s", stale_key, exc
+            )
             sale_client.send_error_message(
                 error_text=str(exc),
-                error_place="save_photo.delete_object(old_object_key)")
+                error_place="save_photo.delete_object(stale_key)",
+            )
 
-    await message.answer(
-        "Фото обновлено! Используй <code>/gen &lt;описание&gt;</code> для генераций с учётом снимка."
+    photo_count = len(reference_urls)
+    base_text = (
+        "Используй <code>/gen &lt;описание&gt;</code> для генераций с учётом снимков."
     )
+    if photo_count <= 1:
+        prefix = "Фото сохранено! Оно станет базовым."
+    else:
+        prefix = (
+            f"Фото сохранено! Теперь у тебя {photo_count} базовых фото "
+            f"(максимум {MAX_REFERENCE_PHOTOS})."
+        )
+
+    await message.answer(f"{prefix} {base_text}")
 
 
 @router.message(Command("gen"))
@@ -323,10 +344,10 @@ async def generate_from_text(message: Message, command: CommandObject):
 
     async with SessionLocal() as session:
         user = await ensure_user(session, message.from_user.id)
-        photo_url = user.photo_url
+        photo_urls = get_user_photo_urls(user)
         await _commit_session(session)
 
-    if not photo_url:
+    if not photo_urls:
         await message.answer(
             "Сначала отправь фото, чтобы мы могли использовать его в качестве референса для генераций."
         )
@@ -337,7 +358,9 @@ async def generate_from_text(message: Message, command: CommandObject):
     )
 
     try:
-        result = await _perform_generation(prompt, reference_urls=[photo_url])
+        result = await _perform_generation(
+            prompt, reference_urls=photo_urls[:MAX_REFERENCE_PHOTOS]
+        )
         if not result:
             await message.answer(
                 "❌ Не удалось сгенерировать изображение, попробуй позже."
@@ -401,7 +424,7 @@ async def handle_prompt_choice(
 
     async with SessionLocal() as session:
         user = await ensure_user(session, callback.from_user.id)
-        photo_url = user.photo_url
+        photo_urls = get_user_photo_urls(user)
         await _commit_session(session)
 
     # 🌀 Анимация
@@ -410,9 +433,11 @@ async def handle_prompt_choice(
     )
 
     try:
-        if mode == "edit" and photo_url:
-            logger.info(f"Using reference photo: {photo_url}")
-            result = await _perform_generation(prompt, reference_urls=[photo_url])
+        if mode == "edit" and photo_urls:
+            logger.info(f"Using reference photos: {photo_urls}")
+            result = await _perform_generation(
+                prompt, reference_urls=photo_urls[:MAX_REFERENCE_PHOTOS]
+            )
         else:
             logger.info("Generating from text only (no reference)")
             result = await _perform_generation(prompt)
