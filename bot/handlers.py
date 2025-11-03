@@ -376,7 +376,10 @@ async def generate_from_text(message: Message, command: CommandObject):
 
     except Exception as e:
         stop_animation()
-        await wait_msg.edit_text(f"⚠️ Ошибка: {e}")
+        sale_client.send_error_message(
+            error_text=str(e),
+            error_place="generate_from_text._perform_generation"
+        )
 
 
 
@@ -466,7 +469,7 @@ async def handle_prompt_choice(
             error_text=str(e),
             error_place="handle_prompt_choice._perform_generation"
         )
-        await wait_msg.edit_text(f"⚠️ Ошибка: {e}")
+        await wait_msg.edit_text(f"Что-то пошло не так, попробуйте позже...")
 
 
 @router.callback_query(PromptRegenCallback.filter())
@@ -556,7 +559,7 @@ async def handle_iterative_edit(message: Message, bot: Bot):
 
     except Exception as exc:
         stop_animation()
-        await wait_msg.edit_text(f"⚠️ Ошибка при генерации: {exc}")
+        await wait_msg.edit_text(f"Что-то пошло не так, попробуйте позже...")
         sale_client.send_error_message(
             error_text=str(exc),
             error_place="handle_iterative_edit._perform_generation")
@@ -598,7 +601,7 @@ async def generate_without_base(message: Message, command: CommandObject):
 
     except Exception as e:
         stop_animation()
-        await wait_msg.edit_text(f"⚠️ Ошибка: {e}")
+        await wait_msg.edit_text(f"Что-то пошло не так, попробуйте позже...")
         sale_client.send_error_message(
             error_text=str(e),
             error_place="generate_without_base._perform_generation")
