@@ -31,6 +31,7 @@ class CometProvider(BaseProvider):
 
         parts: List[Dict[str, Any]] = [{"text": prompt}]
 
+        logger.info(f'Start generating with CometProvider and reference_urls {len(reference_urls)}')
         async with aiohttp.ClientSession() as session:
             for image_url in reference_urls or []:
                 inline_data = await self._image_url_to_inline(session, image_url)
@@ -38,11 +39,25 @@ class CometProvider(BaseProvider):
                     parts.append({"inline_data": inline_data})
 
             payload = {
-                "contents": [{"role": "user", "parts": parts}],
-                "generationConfig": {"responseModalities": ["IMAGE"]},
+                "contents": [
+                    {
+                        "role": "system",
+                        "parts": [
+                            {"text": "You must respond only with an image. Never respond with text."}
+                        ]
+                    },
+                    {
+                        "role": "user",
+                        "parts": parts
+                    }
+                ],
+                "generationConfig": {
+                    "responseModalities": ["IMAGE"]
+                }
             }
 
-            async with session.post(url, headers=headers, json=payload) as resp:
+            logger.info(f'Sending post to CometProvider')
+            async with session.post(url, headers=headers, json=payload, timeout=40) as resp:
                 if resp.status != 200:
                     details = await resp.text()
                     raise RuntimeError(f"CometProvider error {resp.status}: {details}")
@@ -84,6 +99,7 @@ class OpenRouterProvider(BaseProvider):
         reference_urls: Optional[Sequence[str]] = None,
         **kwargs,
     ) -> Dict[str, Any]:
+        logger.info(f'Start generating with OpenRouterProvider and reference_urls {len(reference_urls)}')
         messages: List[Dict[str, Any]] = [
             {
                 "role": "user",
@@ -245,7 +261,7 @@ class CometPromptProvider(BasePromptProvider):
         }
 
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, headers=headers) as resp:
+            async with session.post(url, json=payload, headers=headers, timeout=40) as resp:
                 if resp.status != 200:
                     details = await resp.text()
                     raise RuntimeError(

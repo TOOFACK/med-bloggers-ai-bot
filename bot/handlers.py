@@ -3,6 +3,7 @@ import html
 import logging
 from typing import Any, Dict, List, Optional
 
+from aiogram.types import BufferedInputFile
 from aiogram import Bot, F, Router, types
 from aiogram.filters import Command
 from aiogram.filters.command import CommandObject
@@ -34,7 +35,7 @@ from core.utils import (
     input_file_from_base64,
     normalize_text,
 )
-
+import base64
 from .keyboards import (
     PromptChoiceCallback,
     PromptRegenCallback,
@@ -222,7 +223,7 @@ async def _send_generation(message: Message, result: Dict[str, Any], caption: st
     await message.answer("Не удалось обработать результат генерации. Попробуй еще раз")
 
 
-@router.message(Command("start"))
+@router.message(Command("start", "help", "info"))
 async def start(message: Message):
     if not message.from_user:
         await message.answer("Не распознали пользователя.")
@@ -239,7 +240,7 @@ async def start(message: Message):
         "• Пришли до 3 своих фото, где хорошо видно лицо (лучше с разных ракурсов) — я сохраню их как базу.\n"
         "• <code>/gen</code> + описание — отредактирую твоё фото по заданию.\n"
         "• <code>/free_gen</code> + описание — создам новое изображение с нуля.\n"
-        "• Просто пришли текст (например, пост или идею для видео) — предложу варианты визуализаций. Ты выберешь: с нуля или на основе фото.\n"
+        "• <code>/get_prompts</code> + описание — предложу варианты визуализаций. Ты выберешь: с нуля или на основе фото.\n"
         "• Можно редактировать итеративно — просто ответь на картинку и напиши, что изменить.\n\n"
         "👇 Нажми кнопку, чтобы начать!"
     )
@@ -383,8 +384,8 @@ async def generate_from_text(message: Message, command: CommandObject):
 
 
 
-@router.message(F.text & ~F.via_bot & ~F.text.startswith("/") & ~F.reply_to_message)
-async def handle_post(message: Message, state: FSMContext):
+@router.message(Command("get_prompts"))
+async def handle_get_prompts(message: Message, state: FSMContext):
     logger.info("starting promts from message")
     if not message.from_user or not message.text:
         return
@@ -397,6 +398,9 @@ async def handle_post(message: Message, state: FSMContext):
         reply_markup=prompt_mode_keyboard(),
     )
 
+@router.message(F.text & ~F.via_bot & ~F.text.startswith("/") & ~F.reply_to_message)
+async def handle_plain_text(message: Message, state: FSMContext):
+    await message.answer("Используй одну из команд <code>/get_prompts</code>, <code>/free_gen</code>, <code>/gen</code>")
 
 @router.callback_query(PromptChoiceCallback.filter())
 async def handle_prompt_choice(

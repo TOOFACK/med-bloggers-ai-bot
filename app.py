@@ -13,11 +13,13 @@ logging.basicConfig(level=logging.INFO)
 
 
 if BOT_MODE == "test":
+    logging.info("Using test bot")
     bot = Bot(
         token=API_TOKEN_LOCAL,
         default=DefaultBotProperties(parse_mode="HTML"),
     )
 else:
+    logging.info("Using prod bot")
     bot = Bot(
         token=API_TOKEN,
         default=DefaultBotProperties(parse_mode="HTML"),

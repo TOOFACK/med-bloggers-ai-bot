@@ -28,6 +28,7 @@ class ModelService:
 
         errors: list[str] = []
         for provider in self.providers:
+            logger.info(f'using provider {self.providers}')
             try:
                 result = await provider.generate(prompt, reference_urls=reference_urls)
             except Exception as exc:  # noqa: BLE001
