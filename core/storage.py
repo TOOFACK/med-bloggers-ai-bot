@@ -5,6 +5,9 @@ from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import declarative_base
 
+import logging
+logging.basicConfig(level=logging.INFO)
+
 Base = declarative_base()
 
 MAX_REFERENCE_PHOTOS = 3
@@ -43,6 +46,9 @@ async def set_user_photo(
     photo_url: str,
     photo_object_key: str,
 ) -> Tuple[User, List[str]]:
+    
+    logging.info(f'inside set_user_photo {user}')
+
     photo_urls = list(user.photo_urls or [])
     photo_object_keys = list(user.photo_object_keys or [])
 
@@ -50,12 +56,16 @@ async def set_user_photo(
     photo_object_keys.append(photo_object_key)
 
     removed_keys: List[str] = []
+    if len(photo_urls) > MAX_REFERENCE_PHOTOS:
+        logging.info(f'user {user} has more than {MAX_REFERENCE_PHOTOS}, deleting old...')
     while len(photo_urls) > MAX_REFERENCE_PHOTOS:
+        logging.info(f'deleting {photo_urls[0]} from user {user}')
         photo_urls.pop(0)
         removed_key = photo_object_keys.pop(0)
         if removed_key:
             removed_keys.append(removed_key)
-
+    
+    logging.info(f'Now user {user} has {photo_urls}')
     user.photo_urls = photo_urls
     user.photo_object_keys = photo_object_keys
     user.photo_url = photo_urls[-1] if photo_urls else None

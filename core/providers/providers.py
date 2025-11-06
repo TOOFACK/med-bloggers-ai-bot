@@ -39,21 +39,12 @@ class CometProvider(BaseProvider):
                     parts.append({"inline_data": inline_data})
 
             payload = {
-                "contents": [
-                    {
-                        "role": "system",
-                        "parts": [
-                            {"text": "You must respond only with an image. Never respond with text."}
-                        ]
-                    },
-                    {
-                        "role": "user",
-                        "parts": parts
-                    }
-                ],
-                "generationConfig": {
-                    "responseModalities": ["IMAGE"]
-                }
+
+
+                "contents": [{"role": "user", "parts": parts}],
+
+
+                "generationConfig": {"responseModalities": ["IMAGE"]},
             }
 
             logger.info(f'Sending post to CometProvider')

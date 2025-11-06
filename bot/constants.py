@@ -14,6 +14,7 @@ PROMPT_SUGGESTION_COUNT = 3
 #     "используя следующий контекст. Верни результат в виде JSON-массива строк."
 # ).format(count=PROMPT_SUGGESTION_COUNT)
 
-SYSTEM_PROMPT_FOR_CREATING = ("Сформируй {count} коротких промптов для генерации изображений на русском языке, "
+SYSTEM_PROMPT_FOR_CREATING = ("Сформируй {count} креативных и визуально детализированных промптов для генерации изображений на русском языке, "
             "используя следующий контекст. Верни результат в виде JSON-массива строк.").format(count=PROMPT_SUGGESTION_COUNT)
-SYSTEM_PROMPT_FOR_EDIT = SYSTEM_PROMPT_FOR_CREATING
+SYSTEM_PROMPT_FOR_EDIT = ("Сформируй {count} креативных и визуально детализированных промптов для генерации изображений, на русском языке, "
+            "используя следующий контекст. Верни результат в виде JSON-массива строк.").format(count=PROMPT_SUGGESTION_COUNT)
