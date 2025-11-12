@@ -31,7 +31,10 @@ class CometProvider(BaseProvider):
 
         parts: List[Dict[str, Any]] = [{"text": prompt}]
 
-        logger.info(f'Start generating with CometProvider and reference_urls {len(reference_urls)}')
+        if reference_urls:
+            logger.info(f'Start generating with CometProvider and reference_urls {len(reference_urls)}')
+        else:
+            logger.info(f'Start generating with CometProvider a new image')
         async with aiohttp.ClientSession() as session:
             for image_url in reference_urls or []:
                 inline_data = await self._image_url_to_inline(session, image_url)
@@ -90,7 +93,10 @@ class OpenRouterProvider(BaseProvider):
         reference_urls: Optional[Sequence[str]] = None,
         **kwargs,
     ) -> Dict[str, Any]:
-        logger.info(f'Start generating with OpenRouterProvider and reference_urls {len(reference_urls)}')
+        if reference_urls:
+            logger.info(f'Start generating with OpenRouterProvider and reference_urls {len(reference_urls)}')
+        else:
+            logger.info(f'Start generating with OpenRouterProvider a new image')
         messages: List[Dict[str, Any]] = [
             {
                 "role": "user",
