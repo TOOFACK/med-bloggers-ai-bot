@@ -28,6 +28,12 @@ OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/ap
 
 PROMPT_MODEL = os.getenv("PROMPT_MODEL", "google/gemini-2.0-flash")
 
+VERTEX_CREDENTIALS_PATH = os.getenv("VERTEX_CREDENTIALS_PATH")
+VERTEX_PROJECT_ID = os.getenv("VERTEX_PROJECT_ID")
+VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "us-central1")
+VERTEX_IMAGE_MODEL = os.getenv("VERTEX_IMAGE_MODEL", "gemini-2.5-flash-image")
+VERTEX_ASPECT_RATIO = os.getenv("VERTEX_ASPECT_RATIO")
+
 S3_BUCKET = os.getenv("S3_BUCKET")
 S3_REGION = os.getenv("S3_REGION", "")
 S3_ACCESS_KEY_ID = os.getenv("S3_ACCESS_KEY_ID")

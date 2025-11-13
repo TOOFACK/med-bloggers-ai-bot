@@ -1,13 +1,23 @@
 import asyncio
 import base64
+from io import BytesIO
 import json
 import logging
 from typing import Any, Dict, List, Optional, Sequence
 
 import aiohttp
 from openai import OpenAI
-
+from PIL import Image
 from .base import BasePromptProvider, BaseProvider
+
+try:
+    from google import genai
+    from google.genai import types
+    import google.auth
+except ImportError:  # pragma: no cover - optional dependency
+    genai = None  # type: ignore[assignment]
+    types = None  # type: ignore[assignment]
+    google = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +130,177 @@ class OpenRouterProvider(BaseProvider):
 
         payload = _extract_openrouter_payload(completion)
         return payload | {"provider": self.name}
+
+
+class VertexAIProvider(BaseProvider):
+    def __init__(
+        self,
+        credentials_path: str,
+        project: str,
+        location: str = "us-central1",
+        model: str = "gemini-2.5-flash-image",
+        scopes: Optional[Sequence[str]] = None,
+        aspect_ratio: Optional[str] = None,
+    ):
+        if genai is None or types is None or google is None:
+            raise RuntimeError(
+                "Пакет google-genai не установлен. Добавьте его в зависимости проекта."
+            )
+
+        scope_list = list(scopes or ["https://www.googleapis.com/auth/cloud-platform"])
+        credentials, _ = google.auth.load_credentials_from_file(
+            credentials_path,
+            scopes=scope_list,
+        )
+
+        self.client = genai.Client(
+            vertexai=True,
+            project=project,
+            location=location,
+            credentials=credentials,
+        )
+        self.model = model
+        self.aspect_ratio = aspect_ratio
+
+    async def generate(
+        self,
+        prompt: str,
+        reference_urls: Optional[Sequence[str]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        logger.info("Start generating with VertexAIProvider")
+        contents: List[Any] = [prompt]
+
+        if reference_urls:
+            async with aiohttp.ClientSession() as session:
+                for image_url in reference_urls:
+                    part = await self._image_url_to_part(session, image_url)
+                    if part is not None:
+                        contents.append(part)
+
+        config_kwargs: Dict[str, Any] = {"response_modalities": ["IMAGE"]}
+        if self.aspect_ratio:
+            config_kwargs["image_config"] = types.ImageConfig(
+                aspect_ratio=self.aspect_ratio
+            )
+        config = types.GenerateContentConfig(**config_kwargs)
+
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: self.client.models.generate_content(
+                model=self.model,
+                contents=contents,
+                config=config,
+            ),
+        )
+
+        img_b64 = self._extract_image_base64(response)
+
+        if not img_b64:
+            raise RuntimeError("Vertex AI не вернул изображение.")
+        return {"type": "base64", "data": img_b64, "provider": self.name}
+
+
+
+    async def _image_url_to_part(self, session, image_url):
+        # Google сам скачает и обработает URI, нам не нужно трогать байты
+        try:
+            return types.Part.from_uri(
+                file_uri=image_url,
+                mime_type="image/jpeg"
+            )
+        except Exception as exc:
+            logger.warning("VertexAIProvider: can't create Part from %s: %s", image_url, exc)
+            return None
+
+
+    # def _extract_image_base64(self, response: Any) -> Optional[str]:
+    #     parts = getattr(response, "parts", None)
+    #     if not parts:
+    #         logger.warning("VertexAIProvider: response.parts is empty or None")
+    #         return None
+
+    #     for part in parts:
+    #         try:
+    #             out_img = part.as_image()
+    #         except Exception:
+    #             continue
+
+    #         if not out_img or not out_img.image_bytes:
+    #             continue
+
+    #         raw = out_img.image_bytes
+
+
+    #         # --- 1. Попытка распознать base64 строку ---
+    #         # PNG b64 начинается с iVBOR..., JPEG с /9j/
+    #         if raw.startswith(b"iVBOR") or raw.startswith(b"/9j/"):
+    #             try:
+    #                 logger.info("Gemini returned base64-wrapped image, returning...")
+    #                 raw = base64.b64decode(raw)
+    #             except Exception as exc:
+    #                 logger.warning("Failed to decode base64 image: %s", exc)
+    #                 continue
+
+    #         # --- 2. Проверяем сигнатуру ---
+    #         if not (raw.startswith(b"\x89PNG") or raw.startswith(b"\xff\xd8\xff")):
+    #             # Это НЕ картинка
+    #             try:
+    #                 text_preview = raw.decode("utf-8", errors="replace")
+    #             except Exception:
+    #                 text_preview = str(raw)
+    #             logger.error("===== GEMINI RETURNED NON-IMAGE DATA =====")
+    #             logger.error("first 300 bytes:\n%s", text_preview[:300])
+    #             continue
+
+    #         # --- 3. Пытаемся открыть как PIL ---
+    #         try:
+    #             pil_img = Image.open(BytesIO(raw)).convert("RGB")
+    #         except Exception as exc:
+    #             logger.warning("PIL failed to decode image: %s", exc)
+    #             continue
+
+    #         # --- 4. Telegram-safe JPEG ---
+    #         buf = BytesIO()
+    #         pil_img.save(buf, "JPEG", quality=90)
+    #         jpeg_bytes = buf.getvalue()
+
+    #         # --- 5. Отдаём base64 JPEG ---
+    #         return base64.b64encode(jpeg_bytes).decode("utf-8")
+
+    #     return None
+
+    def _extract_image_base64(self, response: Any) -> Optional[str]:
+        parts = getattr(response, "parts", None)
+        if not parts:
+            return None
+
+        for part in parts:
+            try:
+                out_img = part.as_image()
+            except Exception:
+                continue
+
+            if not out_img or not out_img.image_bytes:
+                continue
+
+            raw = out_img.image_bytes
+
+            # Если Gemini отдал PNG в виде base64 (iVBOR..., /9j/...), просто оформим это как base64
+            try:
+                # Проверяем, выглядит ли raw как base64-строка
+                # (начинается с ASCII-символов и может быть декодирована)
+                base64.b64decode(raw, validate=True)
+                # Значит raw уже base64 → просто возвращаем строку
+                return raw.decode("utf-8")
+            except Exception:
+                # Значит raw — это реальные байты изображения, нужно закодировать
+                return base64.b64encode(raw).decode("utf-8")
+
+        return None
+
+
 
 
 def _extract_comet_base64(payload: Dict[str, Any]) -> Optional[str]:

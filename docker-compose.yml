@@ -44,6 +44,9 @@ services:
     restart: always
     volumes:
       - .:/app
+      - /home/pavel/work/SIde/Nano-Banana-bot/secret/master-rhino-477612-p3-28172bb9d80a.json:/secrets/gcp.json:ro
+    environment:
+      - GOOGLE_APPLICATION_CREDENTIALS=/secrets/gcp.json
 
 volumes:
   pgdata:

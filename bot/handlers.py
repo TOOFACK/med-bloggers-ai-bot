@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 
 from aiogram.types import BufferedInputFile
 from aiogram import Bot, F, Router, types
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.filters.command import CommandObject
 from aiogram.fsm.context import FSMContext
@@ -16,7 +17,11 @@ from config import (
     COMET_BASE_URL,
     OPENROUTER_API_KEY,
     OPENROUTER_BASE_URL,
-    PROMPT_MODEL
+    VERTEX_ASPECT_RATIO,
+    VERTEX_CREDENTIALS_PATH,
+    VERTEX_IMAGE_MODEL,
+    VERTEX_LOCATION,
+    VERTEX_PROJECT_ID,
 )
 from core.db import SessionLocal
 from core.providers import init_image_providers, init_prompt_providers
@@ -61,6 +66,11 @@ image_providers = init_image_providers(
     openrouter_api_key=OPENROUTER_API_KEY,
     comet_base_url=COMET_BASE_URL,
     openrouter_base_url=OPENROUTER_BASE_URL,
+    vertex_credentials_path=VERTEX_CREDENTIALS_PATH,
+    vertex_project=VERTEX_PROJECT_ID,
+    vertex_location=VERTEX_LOCATION,
+    vertex_model=VERTEX_IMAGE_MODEL,
+    vertex_aspect_ratio=VERTEX_ASPECT_RATIO,
 )
 if not image_providers:
     logger.warning("На запуске не найдено ни одного провайдера генерации изображений.")
@@ -381,6 +391,9 @@ async def generate_from_text(message: Message, command: CommandObject):
             error_text=str(e),
             error_place="generate_from_text._perform_generation"
         )
+        await message.answer(
+                "❌ Не удалось сгенерировать изображение, попробуй позже."
+            )
 
 
 
