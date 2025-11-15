@@ -17,6 +17,7 @@ from config import (
     COMET_BASE_URL,
     OPENROUTER_API_KEY,
     OPENROUTER_BASE_URL,
+    PAYMENTS_ACTIVE,
     VERTEX_ASPECT_RATIO,
     VERTEX_CREDENTIALS_PATH,
     VERTEX_IMAGE_MODEL,
@@ -28,10 +29,13 @@ from core.providers import init_image_providers, init_prompt_providers
 from core.s3 import S3ConfigError, delete_object, upload_bytes
 from core.services import ModelService, PromptService
 from core.storage import (
-    ensure_user,
+    MAX_REFERENCE_PHOTOS,
+    SubsInfo,
+    decrement_photo_quota,
+    decrement_text_quota,
+    ensure_user_with_subscription,
     get_user_photo_urls,
     set_user_photo,
-    MAX_REFERENCE_PHOTOS,
 )
 from core.utils import (
     build_file_url,
@@ -129,6 +133,68 @@ def _prune_map(data: Dict[str, Any], keep: int = 20) -> Dict[str, Any]:
         return data
     keys = sorted(data.keys(), key=int)[-keep:]
     return {key: data[key] for key in keys}
+
+
+def _user_profile_kwargs(user: Optional[types.User]) -> Dict[str, Optional[str]]:
+    if not user:
+        return {}
+    return {
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "username": user.username,
+    }
+
+
+def _format_subscription_status_message(tg_id: int, subscription: Optional[SubsInfo]) -> str:
+    if not PAYMENTS_ACTIVE or subscription is None:
+        return (
+            "Сейчас генерации безлимитны.\n"
+        )
+
+    def _fmt(value: Optional[int]) -> str:
+        if value is None:
+            return "∞"
+        return str(max(value, 0))
+
+    return (
+        "📊 <b>Статус подписки</b>\n"
+        f"Генераций изображений осталось: <b>{_fmt(subscription.photo_left)}</b>\n"
+        f"Запросов промптов осталось: <b>{_fmt(subscription.text_left)}</b>\n"
+    )
+
+
+def _quota_warning_message(tg_id: int, quota_type: str) -> str:
+    if quota_type == "photo":
+        label = "генерации изображений"
+    else:
+        label = "запросы на промпты"
+    return (
+        f"Закончились {label}. Пополни подписку у администратора.\n"
+        f"Твой Telegram ID: <code>{tg_id}</code>\n"
+        "Используй команду /status, чтобы проверить баланс."
+    )
+
+
+async def _consume_photo_quota(tg_id: int) -> None:
+    if not PAYMENTS_ACTIVE:
+        return
+    async with SessionLocal() as session:
+        user, _ = await ensure_user_with_subscription(session, tg_id)
+        ok = await decrement_photo_quota(session, user)
+        if not ok:
+            logger.warning("Не удалось списать генерацию для пользователя %s", tg_id)
+        await _commit_session(session)
+
+
+async def _consume_text_quota(tg_id: int) -> None:
+    if not PAYMENTS_ACTIVE:
+        return
+    async with SessionLocal() as session:
+        user, _ = await ensure_user_with_subscription(session, tg_id)
+        ok = await decrement_text_quota(session, user)
+        if not ok:
+            logger.warning("Не удалось списать текстовый запрос для пользователя %s", tg_id)
+        await _commit_session(session)
 
 
 async def _commit_session(session):
@@ -240,7 +306,11 @@ async def start(message: Message):
         return
 
     async with SessionLocal() as session:
-        await ensure_user(session, message.from_user.id)
+        await ensure_user_with_subscription(
+            session,
+            message.from_user.id,
+            **_user_profile_kwargs(message.from_user),
+        )
         await _commit_session(session)
 
     instructions = (
@@ -262,6 +332,27 @@ async def start(message: Message):
     )
 
     await message.answer(instructions, reply_markup=keyboard)
+
+
+@router.message(Command("status", "balance"))
+async def handle_status(message: Message):
+    if not message.from_user:
+        await message.answer("Не распознали пользователя.")
+        return
+
+    if not PAYMENTS_ACTIVE:
+        await message.answer(_format_subscription_status_message(message.from_user.id, None))
+        return
+
+    async with SessionLocal() as session:
+        _, subscription = await ensure_user_with_subscription(
+            session,
+            message.from_user.id,
+            **_user_profile_kwargs(message.from_user),
+        )
+        await _commit_session(session)
+
+    await message.answer(_format_subscription_status_message(message.from_user.id, subscription))
 
 
 @router.callback_query(F.data == "start_work")
@@ -290,7 +381,11 @@ async def save_photo(message: Message, bot: Bot):
     reference_urls: List[str] = []
 
     async with SessionLocal() as session:
-        user = await ensure_user(session, message.from_user.id)
+        user, _ = await ensure_user_with_subscription(
+            session,
+            message.from_user.id,
+            **_user_profile_kwargs(message.from_user),
+        )
 
         try:
             object_key, url = await upload_bytes(
@@ -353,9 +448,18 @@ async def generate_from_text(message: Message, command: CommandObject):
         return
 
     async with SessionLocal() as session:
-        user = await ensure_user(session, message.from_user.id)
+        user, subscription = await ensure_user_with_subscription(
+            session,
+            message.from_user.id,
+            **_user_profile_kwargs(message.from_user),
+        )
         photo_urls = get_user_photo_urls(user)
+        photo_left = subscription.photo_left if PAYMENTS_ACTIVE else None
         await _commit_session(session)
+
+    if PAYMENTS_ACTIVE and photo_left is not None and photo_left <= 0:
+        await message.answer(_quota_warning_message(message.from_user.id, "photo"))
+        return
 
     if not photo_urls:
         await message.answer(
@@ -384,6 +488,7 @@ async def generate_from_text(message: Message, command: CommandObject):
         await wait_msg.delete()
 
         await _send_generation(message, result, caption=f"Готово! 🎨\n\n{prompt}")
+        await _consume_photo_quota(message.from_user.id)
 
     except Exception as e:
         stop_animation()
@@ -437,14 +542,27 @@ async def handle_prompt_choice(
 
     prompt = prompts[callback_data.index]
     mode = state_data.get("prompt_mode", "edit")  # <- сохраняли при выборе стиля
-    await callback.answer("Генерируем…", show_alert=False)
 
     logger.info(f"Selected prompt {prompt} (mode={mode})")
 
     async with SessionLocal() as session:
-        user = await ensure_user(session, callback.from_user.id)
+        user, subscription = await ensure_user_with_subscription(
+            session,
+            callback.from_user.id,
+            **_user_profile_kwargs(callback.from_user),
+        )
         photo_urls = get_user_photo_urls(user)
+        photo_left = subscription.photo_left if PAYMENTS_ACTIVE else None
         await _commit_session(session)
+
+    if PAYMENTS_ACTIVE and photo_left is not None and photo_left <= 0:
+        await callback.message.answer(
+            _quota_warning_message(callback.from_user.id, "photo")
+        )
+        await callback.answer("Закончились генерации", show_alert=True)
+        return
+
+    await callback.answer("Генерируем…", show_alert=False)
 
     # 🌀 Анимация
     wait_msg, stop_animation = await start_loading_animation(
@@ -479,6 +597,7 @@ async def handle_prompt_choice(
             result,
             caption=f"{caption_header}\n\n{prompt}",
         )
+        await _consume_photo_quota(callback.from_user.id)
 
     except Exception as e:
         stop_animation()
@@ -504,6 +623,24 @@ async def handle_prompt_regenerate(callback: CallbackQuery, callback_data: Promp
     else:
         instruction = SYSTEM_PROMPT_FOR_CREATING
 
+    text_left: Optional[int] = None
+    if PAYMENTS_ACTIVE:
+        async with SessionLocal() as session:
+            _, subscription = await ensure_user_with_subscription(
+                session,
+                callback.from_user.id,
+                **_user_profile_kwargs(callback.from_user),
+            )
+            text_left = subscription.text_left
+            await _commit_session(session)
+
+        if text_left is not None and text_left <= 0:
+            await callback.message.answer(
+                _quota_warning_message(callback.from_user.id, "text")
+            )
+            await callback.answer("Нет лимита на промпты", show_alert=True)
+            return
+
     wait_msg, stop_animation = await start_loading_animation(callback.message, "♻️ Генерируем новые промпты")
 
     try:
@@ -519,6 +656,12 @@ async def handle_prompt_regenerate(callback: CallbackQuery, callback_data: Promp
         stop_animation()
         await wait_msg.delete()
 
+    if not prompts:
+        await callback.message.answer("Не удалось составить варианты промптов, попробуй другой текст.")
+        return
+
+    await _consume_text_quota(callback.from_user.id)
+
     await callback.message.answer(
         _format_prompt_message(prompts),
         reply_markup=prompt_suggestions_keyboard(callback_data.message_id, prompts, mode),
@@ -533,10 +676,27 @@ async def handle_iterative_edit(message: Message, bot: Bot):
     Пользователь отвечает на фото (которое бот сгенерировал),
     и пишет текст для доработки — "Сделай ночь", "Добавь свет", и т.п.
     """
+    if not message.from_user:
+        await message.answer("Не распознали пользователя.")
+        return
+
     reply = message.reply_to_message
 
     # Проверяем, что ответ именно на фото
     if not reply.photo:
+        return
+
+    async with SessionLocal() as session:
+        _, subscription = await ensure_user_with_subscription(
+            session,
+            message.from_user.id,
+            **_user_profile_kwargs(message.from_user),
+        )
+        photo_left = subscription.photo_left if PAYMENTS_ACTIVE else None
+        await _commit_session(session)
+
+    if PAYMENTS_ACTIVE and photo_left is not None and photo_left <= 0:
+        await message.answer(_quota_warning_message(message.from_user.id, "photo"))
         return
 
     # Получаем URL файла из Telegram
@@ -573,6 +733,7 @@ async def handle_iterative_edit(message: Message, bot: Bot):
         await _send_generation(
             message, result, caption=f"✨ Новая версия по запросу:\n\n{message.text}"
         )
+        await _consume_photo_quota(message.from_user.id)
 
     except Exception as exc:
         stop_animation()
@@ -596,6 +757,19 @@ async def generate_without_base(message: Message, command: CommandObject):
         await message.answer("Укажи текст после команды: `/free_gen твой промпт`.")
         return
 
+    async with SessionLocal() as session:
+        _, subscription = await ensure_user_with_subscription(
+            session,
+            message.from_user.id,
+            **_user_profile_kwargs(message.from_user),
+        )
+        photo_left = subscription.photo_left if PAYMENTS_ACTIVE else None
+        await _commit_session(session)
+
+    if PAYMENTS_ACTIVE and photo_left is not None and photo_left <= 0:
+        await message.answer(_quota_warning_message(message.from_user.id, "photo"))
+        return
+
     # Показываем анимацию
     wait_msg, stop_animation = await start_loading_animation(
         message, "🎨 Генерируем изображение"
@@ -615,6 +789,7 @@ async def generate_without_base(message: Message, command: CommandObject):
         await wait_msg.delete()
 
         await _send_generation(message, result, caption=f"Готово! 🖼\n\n{prompt}")
+        await _consume_photo_quota(message.from_user.id)
 
     except Exception as e:
         stop_animation()
@@ -632,6 +807,24 @@ async def handle_prompt_mode(callback: CallbackQuery, callback_data: PromptModeC
     if not base_text:
         await callback.answer("Не нашли исходный текст, попробуй снова.", show_alert=True)
         return
+
+    text_left: Optional[int] = None
+    if PAYMENTS_ACTIVE:
+        async with SessionLocal() as session:
+            _, subscription = await ensure_user_with_subscription(
+                session,
+                callback.from_user.id,
+                **_user_profile_kwargs(callback.from_user),
+            )
+            text_left = subscription.text_left
+            await _commit_session(session)
+
+        if text_left is not None and text_left <= 0:
+            await callback.message.answer(
+                _quota_warning_message(callback.from_user.id, "text")
+            )
+            await callback.answer("Нет лимита на промпты", show_alert=True)
+            return
 
     # Сохраняем текущий режим
     await state.update_data(prompt_mode=mode)
@@ -661,6 +854,8 @@ async def handle_prompt_mode(callback: CallbackQuery, callback_data: PromptModeC
     if not prompts:
         await callback.message.answer("Не удалось составить варианты промптов, попробуй другой текст.")
         return
+
+    await _consume_text_quota(callback.from_user.id)
 
     # Сохраняем
     state_data = await state.get_data()

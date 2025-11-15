@@ -1,9 +1,9 @@
 from typing import List, Optional, Tuple
 
-from sqlalchemy import Column, DateTime, Integer, String, func, select
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, func, select
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import declarative_base
+from sqlalchemy.orm import declarative_base, relationship
 
 import logging
 logging.basicConfig(level=logging.INFO)
@@ -18,12 +18,27 @@ class User(Base):
 
     id = Column(Integer, primary_key=True)
     tg_id = Column(String, unique=True, index=True)
+    first_name = Column(String, nullable=True)
+    last_name = Column(String, nullable=True)
+    username = Column(String, nullable=True, index=True)
     photo_url = Column(String, nullable=True)
     photo_object_key = Column(String, nullable=True)
     photo_urls = Column(ARRAY(String), nullable=True)
     photo_object_keys = Column(ARRAY(String), nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, onupdate=func.now())
+    subscription = relationship("SubsInfo", back_populates="user", uselist=False)
+
+
+class SubsInfo(Base):
+    __tablename__ = "subs_info"
+
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    photo_left = Column(Integer, nullable=False, default=0)
+    text_left = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, onupdate=func.now())
+    user = relationship("User", back_populates="subscription", uselist=False)
 
 
 async def get_user_by_tg_id(session: AsyncSession, tg_id: int | str) -> Optional[User]:
@@ -31,13 +46,95 @@ async def get_user_by_tg_id(session: AsyncSession, tg_id: int | str) -> Optional
     return result.scalar_one_or_none()
 
 
-async def ensure_user(session: AsyncSession, tg_id: int | str) -> User:
+async def ensure_user(
+    session: AsyncSession,
+    tg_id: int | str,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    username: Optional[str] = None,
+) -> User:
     user = await get_user_by_tg_id(session, tg_id)
     if user is None:
-        user = User(tg_id=str(tg_id))
+        user = User(
+            tg_id=str(tg_id),
+            first_name=first_name,
+            last_name=last_name,
+            username=username,
+        )
+        session.add(user)
+        await session.flush()
+        return user
+
+    updated = False
+    if first_name is not None and user.first_name != first_name:
+        user.first_name = first_name
+        updated = True
+    if last_name is not None and user.last_name != last_name:
+        user.last_name = last_name
+        updated = True
+    if username is not None and user.username != username:
+        user.username = username
+        updated = True
+    if updated:
         session.add(user)
         await session.flush()
     return user
+
+
+async def ensure_subscription(session: AsyncSession, user: User) -> SubsInfo:
+    subscription = await session.get(SubsInfo, user.id)
+    if subscription is None:
+        subscription = SubsInfo(user_id=user.id)
+        session.add(subscription)
+        await session.flush()
+    return subscription
+
+
+async def ensure_user_with_subscription(
+    session: AsyncSession,
+    tg_id: int | str,
+    *,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    username: Optional[str] = None,
+) -> tuple[User, SubsInfo]:
+    user = await ensure_user(
+        session,
+        tg_id,
+        first_name=first_name,
+        last_name=last_name,
+        username=username,
+    )
+    subscription = await ensure_subscription(session, user)
+    return user, subscription
+
+
+async def decrement_photo_quota(
+    session: AsyncSession, user: User, amount: int = 1
+) -> bool:
+    subscription = await ensure_subscription(session, user)
+    current = subscription.photo_left
+    if current is not None and current < amount:
+        return False
+    if current is not None:
+        subscription.photo_left = current - amount
+        session.add(subscription)
+        await session.flush()
+    return True
+
+
+async def decrement_text_quota(
+    session: AsyncSession, user: User, amount: int = 1
+) -> bool:
+    subscription = await ensure_subscription(session, user)
+    current = subscription.text_left
+    if current is not None and current < amount:
+        return False
+    if current is not None:
+        subscription.text_left = current - amount
+        session.add(subscription)
+        await session.flush()
+    return True
 
 
 async def set_user_photo(
