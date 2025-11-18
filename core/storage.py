@@ -10,6 +10,7 @@ from sqlalchemy import (
     select,
     UniqueConstraint,
     Index,
+    update,
 )
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -60,9 +61,52 @@ class SubsInfo(Base):
     user = relationship("User", back_populates="subscription", uselist=False)
 
 
+QUOTA_COLUMN_MAP = {
+    "photo": SubsInfo.photo_left,
+    "text": SubsInfo.text_left,
+}
+
+
 async def get_user_by_tg_id(session: AsyncSession, tg_id: int | str) -> Optional[User]:
     result = await session.execute(select(User).where(User.tg_id == str(tg_id)))
     return result.scalar_one_or_none()
+
+
+def _quota_column(quota_type: str):
+    column = QUOTA_COLUMN_MAP.get(quota_type)
+    if column is None:
+        raise ValueError(f"Unsupported quota type: {quota_type}")
+    return column
+
+
+async def _apply_quota_delta(
+    session: AsyncSession,
+    user: User,
+    quota_type: str,
+    delta: int,
+) -> bool:
+    column = _quota_column(quota_type)
+    stmt = update(SubsInfo).where(SubsInfo.tg_id == user.tg_id)
+    if delta < 0:
+        stmt = stmt.where(column >= -delta)
+    stmt = stmt.values({column.key: column + delta}).returning(column)
+    result = await session.execute(stmt)
+    updated = result.scalar_one_or_none() is not None
+    if updated:
+        await session.flush()
+    return updated
+
+
+async def consume_quota(
+    session: AsyncSession, user: User, quota_type: str, amount: int = 1
+) -> bool:
+    return await _apply_quota_delta(session, user, quota_type, -amount)
+
+
+async def restore_quota(
+    session: AsyncSession, user: User, quota_type: str, amount: int = 1
+) -> bool:
+    return await _apply_quota_delta(session, user, quota_type, amount)
 
 
 async def ensure_user(
@@ -134,33 +178,17 @@ async def ensure_user_with_subscription(
 
 
 
-async def decrement_text_quota(session: AsyncSession, user: User, amount: int = 1):
-    subscription = await ensure_subscription(session, user)
-
-    if subscription.text_left < amount:
-        logging.warning("Недостаточно текстовой квоты: %s", user.tg_id)
-        return
-
-    subscription.text_left -= amount
-    session.add(subscription)
-    await session.flush()
-    return
+async def decrement_text_quota(
+    session: AsyncSession, user: User, amount: int = 1
+) -> bool:
+    return await consume_quota(session, user, "text", amount)
 
 
 
 async def decrement_photo_quota(
     session: AsyncSession, user: User, amount: int = 1
-):
-    subscription = await ensure_subscription(session, user)
-
-    if subscription.photo_left < amount:
-        logging.warning("Недостаточно фото-квоты: %s", user.tg_id)
-        return
-
-    subscription.photo_left -= amount
-    session.add(subscription)
-    await session.flush()
-    return
+) -> bool:
+    return await consume_quota(session, user, "photo", amount)
 
 
 
