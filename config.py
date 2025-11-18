@@ -49,10 +49,4 @@ SALEBOT_API_KEY = os.getenv('SALEBOT_API_KEY')
 SALEBOT_ADMIN_CHAT_ID = os.getenv('SALEBOT_ADMIN_CHAT_ID')
 
 
-def _env_to_bool(value: str | None, default: bool = False) -> bool:
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-PAYMENTS_ACTIVE = _env_to_bool(os.getenv("PAYMENTS_ACTIVE"), default=False)
+PAYMENTS_ACTIVE = os.getenv("PAYMENTS_ACTIVE") or False

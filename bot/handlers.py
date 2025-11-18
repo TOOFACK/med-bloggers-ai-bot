@@ -157,7 +157,7 @@ def _format_subscription_status_message(tg_id: int, subscription: Optional[SubsI
         return str(max(value, 0))
 
     return (
-        "📊 <b>Статус подписки</b>\n"
+        "📊 <b>Личный кабинет</b>\n"
         f"Генераций изображений осталось: <b>{_fmt(subscription.photo_left)}</b>\n"
         f"Запросов промптов осталось: <b>{_fmt(subscription.text_left)}</b>\n"
     )
@@ -171,7 +171,7 @@ def _quota_warning_message(tg_id: int, quota_type: str) -> str:
     return (
         f"Закончились {label}. Пополни подписку у администратора.\n"
         f"Твой Telegram ID: <code>{tg_id}</code>\n"
-        "Используй команду /status, чтобы проверить баланс."
+        "Используй команду /cabinet, чтобы проверить баланс."
     )
 
 
@@ -180,9 +180,7 @@ async def _consume_photo_quota(tg_id: int) -> None:
         return
     async with SessionLocal() as session:
         user, _ = await ensure_user_with_subscription(session, tg_id)
-        ok = await decrement_photo_quota(session, user)
-        if not ok:
-            logger.warning("Не удалось списать генерацию для пользователя %s", tg_id)
+        await decrement_photo_quota(session, user)
         await _commit_session(session)
 
 
@@ -191,9 +189,7 @@ async def _consume_text_quota(tg_id: int) -> None:
         return
     async with SessionLocal() as session:
         user, _ = await ensure_user_with_subscription(session, tg_id)
-        ok = await decrement_text_quota(session, user)
-        if not ok:
-            logger.warning("Не удалось списать текстовый запрос для пользователя %s", tg_id)
+        await decrement_text_quota(session, user)
         await _commit_session(session)
 
 
@@ -334,7 +330,7 @@ async def start(message: Message):
     await message.answer(instructions, reply_markup=keyboard)
 
 
-@router.message(Command("status", "balance"))
+@router.message(Command("cabinet", "balance"))
 async def handle_status(message: Message):
     if not message.from_user:
         await message.answer("Не распознали пользователя.")
