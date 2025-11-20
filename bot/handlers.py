@@ -1,7 +1,8 @@
 import asyncio
 import html
 import logging
-from typing import Any, Dict, List, Optional
+from functools import wraps
+from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional
 
 from aiogram.types import BufferedInputFile
 from aiogram import Bot, F, Router, types
@@ -17,6 +18,7 @@ from config import (
     COMET_BASE_URL,
     OPENROUTER_API_KEY,
     OPENROUTER_BASE_URL,
+    PAYMENTS_ACTIVE,
     VERTEX_ASPECT_RATIO,
     VERTEX_CREDENTIALS_PATH,
     VERTEX_IMAGE_MODEL,
@@ -28,10 +30,13 @@ from core.providers import init_image_providers, init_prompt_providers
 from core.s3 import S3ConfigError, delete_object, upload_bytes
 from core.services import ModelService, PromptService
 from core.storage import (
-    ensure_user,
-    get_user_photo_urls,
-    set_user_photo,
     MAX_REFERENCE_PHOTOS,
+    SubsInfo,
+    consume_quota,
+    ensure_user_with_subscription,
+    get_user_photo_urls,
+    restore_quota,
+    set_user_photo,
 )
 from core.utils import (
     build_file_url,
@@ -129,6 +134,142 @@ def _prune_map(data: Dict[str, Any], keep: int = 20) -> Dict[str, Any]:
         return data
     keys = sorted(data.keys(), key=int)[-keep:]
     return {key: data[key] for key in keys}
+
+
+def _user_profile_kwargs(user: Optional[types.User]) -> Dict[str, Optional[str]]:
+    if not user:
+        return {}
+    return {
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "username": user.username,
+    }
+
+
+def _format_subscription_status_message(tg_id: int, subscription: Optional[SubsInfo]) -> str:
+    if not PAYMENTS_ACTIVE or subscription is None:
+        return (
+            "Сейчас генерации безлимитны.\n"
+        )
+
+    def _fmt(value: Optional[int]) -> str:
+        if value is None:
+            return "∞"
+        return str(max(value, 0))
+
+    return (
+        "📊 <b>Личный кабинет</b>\n"
+        f"Генераций изображений осталось: <b>{_fmt(subscription.photo_left)}</b>\n"
+        f"Запросов промптов осталось: <b>{_fmt(subscription.text_left)}</b>\n"
+    )
+
+
+def _quota_warning_message(tg_id: int, quota_type: str) -> str:
+    if quota_type == "photo":
+        label = "генерации изображений"
+    else:
+        label = "запросы на промпты"
+    return (
+        f"Закончились {label}. Пополни подписку у администратора.\n"
+        f"Твой Telegram ID: <code>{tg_id}</code>\n"
+        "Используй команду /cabinet, чтобы проверить баланс."
+    )
+
+
+QuotaType = Literal["photo", "text"]
+
+
+async def _notify_missing_user(target: Message | CallbackQuery) -> None:
+    if isinstance(target, CallbackQuery):
+        await target.answer("Не распознали пользователя.", show_alert=True)
+    else:
+        await target.answer("Не распознали пользователя.")
+
+
+async def _notify_quota_exhausted(
+    target: Message | CallbackQuery, quota_type: QuotaType
+) -> None:
+    from_user = getattr(target, "from_user", None)
+    tg_id = from_user.id if from_user else 0
+    warning = _quota_warning_message(tg_id, quota_type)
+    if isinstance(target, CallbackQuery):
+        await target.message.answer(warning)
+        try:
+            await target.answer("Лимит закончился.", show_alert=True)
+        except TelegramBadRequest:
+            pass
+    else:
+        await target.answer(warning)
+
+
+async def _reserve_quota(
+    tg_id: int,
+    quota_type: QuotaType,
+    *,
+    amount: int = 1,
+    profile: Optional[Dict[str, Optional[str]]] = None,
+) -> bool:
+    if not PAYMENTS_ACTIVE:
+        return True
+    async with SessionLocal() as session:
+        user, _ = await ensure_user_with_subscription(
+            session, tg_id, **(profile or {})
+        )
+        updated = await consume_quota(session, user, quota_type, amount)
+        if not updated:
+            await session.rollback()
+            return False
+        await _commit_session(session)
+        return True
+
+
+async def _return_quota(
+    tg_id: int, quota_type: QuotaType, *, amount: int = 1
+) -> None:
+    if not PAYMENTS_ACTIVE:
+        return
+    async with SessionLocal() as session:
+        user, _ = await ensure_user_with_subscription(session, tg_id)
+        await restore_quota(session, user, quota_type, amount)
+        await _commit_session(session)
+
+
+def quota_guard(quota_type: QuotaType, *, amount: int = 1):
+    def decorator(func: Callable[..., Awaitable[bool]]):
+        @wraps(func)
+        async def wrapper(target, *args, **kwargs):
+            from_user = getattr(target, "from_user", None)
+            if from_user is None:
+                await _notify_missing_user(target)
+                return False
+            if not PAYMENTS_ACTIVE:
+                return await func(target, *args, **kwargs)
+            profile = _user_profile_kwargs(from_user)
+            reserved = await _reserve_quota(
+                from_user.id,
+                quota_type,
+                amount=amount,
+                profile=profile,
+            )
+            if not reserved:
+                await _notify_quota_exhausted(target, quota_type)
+                return False
+            try:
+                result = await func(target, *args, **kwargs)
+            except Exception as exc:
+                sale_client.send_error_message(
+                error_text=str(exc),
+                error_place="quota_guard.decorator.result = await func(target, *args, **kwargs)",
+            )
+                await _return_quota(from_user.id, quota_type, amount=amount)
+                raise
+            if result is False:
+                await _return_quota(from_user.id, quota_type, amount=amount)
+            return result
+
+        return wrapper
+
+    return decorator
 
 
 async def _commit_session(session):
@@ -240,7 +381,11 @@ async def start(message: Message):
         return
 
     async with SessionLocal() as session:
-        await ensure_user(session, message.from_user.id)
+        await ensure_user_with_subscription(
+            session,
+            message.from_user.id,
+            **_user_profile_kwargs(message.from_user),
+        )
         await _commit_session(session)
 
     instructions = (
@@ -262,6 +407,27 @@ async def start(message: Message):
     )
 
     await message.answer(instructions, reply_markup=keyboard)
+
+
+@router.message(Command("cabinet", "balance"))
+async def handle_status(message: Message):
+    if not message.from_user:
+        await message.answer("Не распознали пользователя.")
+        return
+
+    if not PAYMENTS_ACTIVE:
+        await message.answer(_format_subscription_status_message(message.from_user.id, None))
+        return
+
+    async with SessionLocal() as session:
+        _, subscription = await ensure_user_with_subscription(
+            session,
+            message.from_user.id,
+            **_user_profile_kwargs(message.from_user),
+        )
+        await _commit_session(session)
+
+    await message.answer(_format_subscription_status_message(message.from_user.id, subscription))
 
 
 @router.callback_query(F.data == "start_work")
@@ -290,7 +456,11 @@ async def save_photo(message: Message, bot: Bot):
     reference_urls: List[str] = []
 
     async with SessionLocal() as session:
-        user = await ensure_user(session, message.from_user.id)
+        user, _ = await ensure_user_with_subscription(
+            session,
+            message.from_user.id,
+            **_user_profile_kwargs(message.from_user),
+        )
 
         try:
             object_key, url = await upload_bytes(
@@ -342,6 +512,241 @@ async def save_photo(message: Message, bot: Bot):
     await message.answer(f"{prefix} {base_text}")
 
 
+@quota_guard("photo")
+async def _generate_from_text_payload(
+    message: Message, *, prompt: str, reference_urls: List[str]
+) -> bool:
+    wait_msg, stop_animation = await start_loading_animation(
+        message, "🎨 Генерируем изображение"
+    )
+    try:
+        result = await _perform_generation(prompt, reference_urls=reference_urls)
+        if not result:
+            await message.answer(
+                "❌ Не удалось сгенерировать изображение, попробуй позже."
+            )
+            return False
+
+        await _send_generation(message, result, caption=f"Готово! 🎨\n\n{prompt}")
+        return True
+    except Exception as exc:
+        sale_client.send_error_message(
+            error_text=str(exc),
+            error_place="_generate_from_text_payload._perform_generation",
+        )
+        await message.answer(
+            "❌ Не удалось сгенерировать изображение, попробуй позже."
+        )
+        return False
+    finally:
+        stop_animation()
+        await wait_msg.delete()
+
+
+@quota_guard("photo")
+async def _prompt_choice_generation(
+    callback: CallbackQuery,
+    *,
+    prompt: str,
+    mode: str,
+    reference_urls: Optional[List[str]],
+) -> bool:
+    wait_msg, stop_animation = await start_loading_animation(
+        callback.message, "🎨 Генерируем изображение"
+    )
+    try:
+        result = await _perform_generation(prompt, reference_urls=reference_urls)
+        if not result:
+            await callback.answer(
+                "❌ Не удалось сгенерировать картинку, попробуй снова.",
+                show_alert=False,
+            )
+            return False
+
+        caption_header = (
+            "🪄 Результат редактуры:" if mode == "edit" else "🌄 Новая генерация:"
+        )
+        await _send_generation(
+            callback.message,
+            result,
+            caption=f"{caption_header}\n\n{prompt}",
+        )
+        return True
+    except Exception as exc:
+        sale_client.send_error_message(
+            error_text=str(exc),
+            error_place="_prompt_choice_generation._perform_generation",
+        )
+        await wait_msg.edit_text("Что-то пошло не так, попробуйте позже...")
+        return False
+    finally:
+        stop_animation()
+        await wait_msg.delete()
+
+
+@quota_guard("photo")
+async def _iterative_edit_generation(
+    message: Message,
+    *,
+    prompt_text: str,
+    reference_url: str,
+) -> bool:
+    wait_msg, stop_animation = await start_loading_animation(
+        message, "🪄 Применяем правки, подожди немного"
+    )
+    try:
+        result = await _perform_generation(prompt_text, reference_urls=[reference_url])
+        if not result:
+            await message.answer(
+                "❌ Не удалось сгенерировать изображение, попробуй позже."
+            )
+            return False
+
+        await _send_generation(
+            message, result, caption=f"✨ Новая версия по запросу:\n\n{prompt_text}"
+        )
+        return True
+    except Exception as exc:
+        sale_client.send_error_message(
+            error_text=str(exc),
+            error_place="_iterative_edit_generation._perform_generation",
+        )
+        await message.answer("Что-то пошло не так, попробуйте позже...")
+        return False
+    finally:
+        stop_animation()
+        await wait_msg.delete()
+
+
+@quota_guard("photo")
+async def _generate_without_base_payload(
+    message: Message, *, prompt: str
+) -> bool:
+    wait_msg, stop_animation = await start_loading_animation(
+        message, "🎨 Генерируем изображение"
+    )
+    try:
+        result = await _perform_generation(prompt)
+        if not result:
+            await message.answer(
+                "❌ Не удалось сгенерировать изображение, попробуй позже."
+            )
+            return False
+
+        await _send_generation(message, result, caption=f"Готово! 🖼\n\n{prompt}")
+        return True
+    except Exception as exc:
+        sale_client.send_error_message(
+            error_text=str(exc),
+            error_place="_generate_without_base_payload._perform_generation",
+        )
+        await message.answer("Что-то пошло не так, попробуйте позже...")
+        return False
+    finally:
+        stop_animation()
+        await wait_msg.delete()
+
+
+@quota_guard("text")
+async def _generate_prompt_mode_payload(
+    callback: CallbackQuery,
+    state: FSMContext,
+    *,
+    base_text: str,
+    mode: str,
+) -> bool:
+    instruction = (
+        SYSTEM_PROMPT_FOR_EDIT if mode == "edit" else SYSTEM_PROMPT_FOR_CREATING
+    )
+    wait_msg, stop_animation = await start_loading_animation(
+        callback.message, "💭 Думаем над промптами"
+    )
+    try:
+        prompts = await prompt_service.generate(
+            text=base_text,
+            count=PROMPT_SUGGESTION_COUNT,
+            instruction=instruction,
+        )
+    except Exception as exc:
+        logger.warning("Prompt generation failed: %s", exc)
+        prompts = generate_prompt_suggestions(base_text)[:PROMPT_SUGGESTION_COUNT]
+        sale_client.send_error_message(
+            error_text=str(exc),
+            error_place="_generate_prompt_mode_payload.prompt_service",
+        )
+    finally:
+        stop_animation()
+        await wait_msg.delete()
+
+    if not prompts:
+        await callback.message.answer(
+            "Не удалось составить варианты промптов, попробуй другой текст."
+        )
+        return False
+
+    state_data = await state.get_data()
+    prompt_sets: Dict[str, List[str]] = state_data.get("prompt_sets", {})
+    prompt_sources: Dict[str, str] = state_data.get("prompt_sources", {})
+    prompt_sets[str(callback.message.message_id)] = prompts
+    prompt_sources[str(callback.message.message_id)] = base_text
+    await state.update_data(
+        prompt_sets=_prune_map(prompt_sets),
+        prompt_sources=_prune_map(prompt_sources),
+    )
+
+    await callback.message.answer(
+        _format_prompt_message(prompts),
+        reply_markup=prompt_suggestions_keyboard(
+            callback.message.message_id, prompts, mode
+        ),
+        disable_web_page_preview=True,
+    )
+    await callback.answer()
+    return True
+
+
+@quota_guard("text")
+async def _prompt_regeneration_payload(
+    callback: CallbackQuery,
+    *,
+    base_text: str,
+    mode: str,
+    message_id: int,
+) -> bool:
+    instruction = (
+        SYSTEM_PROMPT_FOR_EDIT if mode == "edit" else SYSTEM_PROMPT_FOR_CREATING
+    )
+    wait_msg, stop_animation = await start_loading_animation(
+        callback.message, "♻️ Генерируем новые промпты"
+    )
+    try:
+        prompts = await prompt_service.generate(
+            text=base_text,
+            count=PROMPT_SUGGESTION_COUNT,
+            instruction=instruction,
+        )
+    except Exception as exc:
+        logger.warning("Prompt regenerate failed: %s", exc)
+        prompts = generate_prompt_suggestions(base_text)[:PROMPT_SUGGESTION_COUNT]
+    finally:
+        stop_animation()
+        await wait_msg.delete()
+
+    if not prompts:
+        await callback.message.answer(
+            "Не удалось составить варианты промптов, попробуй другой текст."
+        )
+        return False
+
+    await callback.message.answer(
+        _format_prompt_message(prompts),
+        reply_markup=prompt_suggestions_keyboard(message_id, prompts, mode),
+        disable_web_page_preview=True,
+    )
+    await callback.answer("Готово!")
+    return True
+
+
 @router.message(Command("gen"))
 async def generate_from_text(message: Message, command: CommandObject):
     if not message.from_user:
@@ -353,9 +758,18 @@ async def generate_from_text(message: Message, command: CommandObject):
         return
 
     async with SessionLocal() as session:
-        user = await ensure_user(session, message.from_user.id)
+        user, subscription = await ensure_user_with_subscription(
+            session,
+            message.from_user.id,
+            **_user_profile_kwargs(message.from_user),
+        )
         photo_urls = get_user_photo_urls(user)
+        photo_left = subscription.photo_left if PAYMENTS_ACTIVE else None
         await _commit_session(session)
+
+    if PAYMENTS_ACTIVE and photo_left is not None and photo_left <= 0:
+        await message.answer(_quota_warning_message(message.from_user.id, "photo"))
+        return
 
     if not photo_urls:
         await message.answer(
@@ -363,37 +777,11 @@ async def generate_from_text(message: Message, command: CommandObject):
         )
         return
 
-    wait_msg, stop_animation = await start_loading_animation(
-        message, "🎨 Генерируем изображение"
+    await _generate_from_text_payload(
+        message,
+        prompt=prompt,
+        reference_urls=photo_urls[:MAX_REFERENCE_PHOTOS],
     )
-
-    try:
-        result = await _perform_generation(
-            prompt, reference_urls=photo_urls[:MAX_REFERENCE_PHOTOS]
-        )
-        if not result:
-            await message.answer(
-                "❌ Не удалось сгенерировать изображение, попробуй позже."
-            )
-            stop_animation()
-            await wait_msg.delete()
-            return
-
-        # Останавливаем анимацию
-        stop_animation()
-        await wait_msg.delete()
-
-        await _send_generation(message, result, caption=f"Готово! 🎨\n\n{prompt}")
-
-    except Exception as e:
-        stop_animation()
-        sale_client.send_error_message(
-            error_text=str(e),
-            error_place="generate_from_text._perform_generation"
-        )
-        await message.answer(
-                "❌ Не удалось сгенерировать изображение, попробуй позже."
-            )
 
 
 
@@ -437,56 +825,36 @@ async def handle_prompt_choice(
 
     prompt = prompts[callback_data.index]
     mode = state_data.get("prompt_mode", "edit")  # <- сохраняли при выборе стиля
-    await callback.answer("Генерируем…", show_alert=False)
 
     logger.info(f"Selected prompt {prompt} (mode={mode})")
 
     async with SessionLocal() as session:
-        user = await ensure_user(session, callback.from_user.id)
+        user, subscription = await ensure_user_with_subscription(
+            session,
+            callback.from_user.id,
+            **_user_profile_kwargs(callback.from_user),
+        )
         photo_urls = get_user_photo_urls(user)
+        photo_left = subscription.photo_left if PAYMENTS_ACTIVE else None
         await _commit_session(session)
 
-    # 🌀 Анимация
-    wait_msg, stop_animation = await start_loading_animation(
-        callback.message, "🎨 Генерируем изображение"
+    if PAYMENTS_ACTIVE and photo_left is not None and photo_left <= 0:
+        await callback.message.answer(
+            _quota_warning_message(callback.from_user.id, "photo")
+        )
+        await callback.answer("Закончились генерации", show_alert=True)
+        return
+
+    await callback.answer("Генерируем…", show_alert=False)
+    reference_urls = (
+        photo_urls[:MAX_REFERENCE_PHOTOS] if mode == "edit" and photo_urls else None
     )
-
-    try:
-        if mode == "edit" and photo_urls:
-            logger.info(f"Using reference photos: {photo_urls}")
-            result = await _perform_generation(
-                prompt, reference_urls=photo_urls[:MAX_REFERENCE_PHOTOS]
-            )
-        else:
-            logger.info("Generating from text only (no reference)")
-            result = await _perform_generation(prompt)
-
-        if not result:
-            stop_animation()
-            await callback.answer("❌ Не удалось сгенерировать картинку, попробуй снова.", show_alert=False)
-            stop_animation()
-            await wait_msg.delete()
-            return
-
-        stop_animation()
-        await wait_msg.delete()
-
-        caption_header = (
-            "🪄 Результат редактуры:" if mode == "edit" else "🌄 Новая генерация:"
-        )
-        await _send_generation(
-            callback.message,
-            result,
-            caption=f"{caption_header}\n\n{prompt}",
-        )
-
-    except Exception as e:
-        stop_animation()
-        sale_client.send_error_message(
-            error_text=str(e),
-            error_place="handle_prompt_choice._perform_generation"
-        )
-        await wait_msg.edit_text(f"Что-то пошло не так, попробуйте позже...")
+    await _prompt_choice_generation(
+        callback,
+        prompt=prompt,
+        mode=mode,
+        reference_urls=reference_urls,
+    )
 
 
 @router.callback_query(PromptRegenCallback.filter())
@@ -499,32 +867,12 @@ async def handle_prompt_regenerate(callback: CallbackQuery, callback_data: Promp
         await callback.answer("Не нашли исходный текст, пришли сообщение ещё раз.", show_alert=True)
         return
 
-    if mode == "edit":
-        instruction = SYSTEM_PROMPT_FOR_EDIT
-    else:
-        instruction = SYSTEM_PROMPT_FOR_CREATING
-
-    wait_msg, stop_animation = await start_loading_animation(callback.message, "♻️ Генерируем новые промпты")
-
-    try:
-        prompts = await prompt_service.generate(
-            text=base_text,
-            count=PROMPT_SUGGESTION_COUNT,
-            instruction=instruction
-        )
-    except Exception as exc:
-        logger.warning("Prompt regenerate failed: %s", exc)
-        prompts = generate_prompt_suggestions(base_text)[:PROMPT_SUGGESTION_COUNT]
-    finally:
-        stop_animation()
-        await wait_msg.delete()
-
-    await callback.message.answer(
-        _format_prompt_message(prompts),
-        reply_markup=prompt_suggestions_keyboard(callback_data.message_id, prompts, mode),
-        disable_web_page_preview=True,
+    await _prompt_regeneration_payload(
+        callback,
+        base_text=base_text,
+        mode=mode,
+        message_id=callback_data.message_id,
     )
-    await callback.answer("Готово!")
 
 
 @router.message(F.reply_to_message & F.text)
@@ -533,6 +881,10 @@ async def handle_iterative_edit(message: Message, bot: Bot):
     Пользователь отвечает на фото (которое бот сгенерировал),
     и пишет текст для доработки — "Сделай ночь", "Добавь свет", и т.п.
     """
+    if not message.from_user:
+        await message.answer("Не распознали пользователя.")
+        return
+
     reply = message.reply_to_message
 
     # Проверяем, что ответ именно на фото
@@ -552,35 +904,42 @@ async def handle_iterative_edit(message: Message, bot: Bot):
             error_place="handle_iterative_edit")
         return
 
-    # Запускаем анимацию "генерация"
-    wait_msg, stop_animation = await start_loading_animation(
-        message, "🪄 Применяем правки, подожди немного"
+    # # Запускаем анимацию "генерация"
+    # wait_msg, stop_animation = await start_loading_animation(
+    #     message, "🪄 Применяем правки, подожди немного"
+    # )
+
+    # try:
+    #     # Отправляем в пайплайн Nano-Banana (через Comet/Gemini)
+    #     result = await _perform_generation(message.text, reference_urls=[file_url])
+    #     if not result:
+    #         stop_animation()
+    #         await message.answer(
+    #             "❌ Не удалось сгенерировать изображение, попробуй позже."
+    #         )
+    #         return
+
+    #     stop_animation()
+    #     await wait_msg.delete()
+
+    #     await _send_generation(
+    #         message, result, caption=f"✨ Новая версия по запросу:\n\n{message.text}"
+    #     )
+    #     await _consume_photo_quota(message.from_user.id)
+
+    # except Exception as exc:
+    #     stop_animation()
+    #     await wait_msg.edit_text(f"Что-то пошло не так, попробуйте позже...")
+    #     sale_client.send_error_message(
+    #         error_text=str(exc),
+    #         error_place="handle_iterative_edit._perform_generation")
+
+    await _iterative_edit_generation(
+        message,
+        prompt_text=message.text,
+        reference_url=file_url,
+
     )
-
-    try:
-        # Отправляем в пайплайн Nano-Banana (через Comet/Gemini)
-        result = await _perform_generation(message.text, reference_urls=[file_url])
-        if not result:
-            stop_animation()
-            await message.answer(
-                "❌ Не удалось сгенерировать изображение, попробуй позже."
-            )
-            return
-
-        stop_animation()
-        await wait_msg.delete()
-
-        await _send_generation(
-            message, result, caption=f"✨ Новая версия по запросу:\n\n{message.text}"
-        )
-
-    except Exception as exc:
-        stop_animation()
-        await wait_msg.edit_text(f"Что-то пошло не так, попробуйте позже...")
-        sale_client.send_error_message(
-            error_text=str(exc),
-            error_place="handle_iterative_edit._perform_generation")
-
 
 @router.message(Command("free_gen"))
 async def generate_without_base(message: Message, command: CommandObject):
@@ -596,32 +955,48 @@ async def generate_without_base(message: Message, command: CommandObject):
         await message.answer("Укажи текст после команды: `/free_gen твой промпт`.")
         return
 
-    # Показываем анимацию
-    wait_msg, stop_animation = await start_loading_animation(
-        message, "🎨 Генерируем изображение"
-    )
+    async with SessionLocal() as session:
+        _, subscription = await ensure_user_with_subscription(
+            session,
+            message.from_user.id,
+            **_user_profile_kwargs(message.from_user),
+        )
+        photo_left = subscription.photo_left if PAYMENTS_ACTIVE else None
+        await _commit_session(session)
 
-    try:
-        # ⚡ Без reference_urls → чисто текстовая генерация
-        result = await _perform_generation(prompt)
-        if not result:
-            stop_animation()
-            await message.answer(
-                "❌ Не удалось сгенерировать изображение, попробуй позже."
-            )
-            return
+    if PAYMENTS_ACTIVE and photo_left is not None and photo_left <= 0:
+        await message.answer(_quota_warning_message(message.from_user.id, "photo"))
+        return
 
-        stop_animation()
-        await wait_msg.delete()
+    await _generate_without_base_payload(message, prompt=prompt)
 
-        await _send_generation(message, result, caption=f"Готово! 🖼\n\n{prompt}")
+    # # Показываем анимацию
+    # wait_msg, stop_animation = await start_loading_animation(
+    #     message, "🎨 Генерируем изображение"
+    # )
 
-    except Exception as e:
-        stop_animation()
-        await wait_msg.edit_text(f"Что-то пошло не так, попробуйте позже...")
-        sale_client.send_error_message(
-            error_text=str(e),
-            error_place="generate_without_base._perform_generation")
+    # try:
+    #     # ⚡ Без reference_urls → чисто текстовая генерация
+    #     result = await _perform_generation(prompt)
+    #     if not result:
+    #         stop_animation()
+    #         await message.answer(
+    #             "❌ Не удалось сгенерировать изображение, попробуй позже."
+    #         )
+    #         return
+
+    #     stop_animation()
+    #     await wait_msg.delete()
+
+    #     await _send_generation(message, result, caption=f"Готово! 🖼\n\n{prompt}")
+    #     await _consume_photo_quota(message.from_user.id)
+
+    # except Exception as e:
+    #     stop_animation()
+    #     await wait_msg.edit_text(f"Что-то пошло не так, попробуйте позже...")
+    #     sale_client.send_error_message(
+    #         error_text=str(e),
+    #         error_place="generate_without_base._perform_generation")
         
 
 @router.callback_query(PromptModeCallback.filter())
@@ -633,46 +1008,68 @@ async def handle_prompt_mode(callback: CallbackQuery, callback_data: PromptModeC
         await callback.answer("Не нашли исходный текст, попробуй снова.", show_alert=True)
         return
 
+    text_left: Optional[int] = None
+    if PAYMENTS_ACTIVE:
+        async with SessionLocal() as session:
+            _, subscription = await ensure_user_with_subscription(
+                session,
+                callback.from_user.id,
+                **_user_profile_kwargs(callback.from_user),
+            )
+            text_left = subscription.text_left
+            await _commit_session(session)
+
+        if text_left is not None and text_left <= 0:
+            await callback.message.answer(
+                _quota_warning_message(callback.from_user.id, "text")
+            )
+            await callback.answer("Нет лимита на промпты", show_alert=True)
+            return
+
     # Сохраняем текущий режим
     await state.update_data(prompt_mode=mode)
 
-    # Подбираем инструкцию
-    if mode == "edit":
-        instruction = SYSTEM_PROMPT_FOR_EDIT
-    else:
-        instruction = SYSTEM_PROMPT_FOR_CREATING
+    await _generate_prompt_mode_payload(callback, state, base_text=base_text, mode=mode)
 
-    wait_msg, stop_animation = await start_loading_animation(callback.message, "💭 Думаем над промптами")
+    # # Подбираем инструкцию
+    # if mode == "edit":
+    #     instruction = SYSTEM_PROMPT_FOR_EDIT
+    # else:
+    #     instruction = SYSTEM_PROMPT_FOR_CREATING
 
-    try:
-        prompts = await prompt_service.generate(text=base_text, count=PROMPT_SUGGESTION_COUNT, instruction=instruction)
-    except Exception as exc:
-        logger.warning("Prompt generation failed: %s", exc)
-        prompts = generate_prompt_suggestions(base_text)[:PROMPT_SUGGESTION_COUNT]
-        sale_client.send_error_message(
-            error_text=str(exc),
-            error_place="handle_prompt_mode.prompt_service.generate")
-        await callback.message.answer("❌ Не удалось сгенерировать промпты, попробуй позже.")
-    finally:
+    # wait_msg, stop_animation = await start_loading_animation(callback.message, "💭 Думаем над промптами")
+
+    # try:
+    #     prompts = await prompt_service.generate(text=base_text, count=PROMPT_SUGGESTION_COUNT, instruction=instruction)
+    # except Exception as exc:
+    #     logger.warning("Prompt generation failed: %s", exc)
+    #     prompts = generate_prompt_suggestions(base_text)[:PROMPT_SUGGESTION_COUNT]
+    #     sale_client.send_error_message(
+    #         error_text=str(exc),
+    #         error_place="handle_prompt_mode.prompt_service.generate")
+    #     await callback.message.answer("❌ Не удалось сгенерировать промпты, попробуй позже.")
+    # finally:
         
-        stop_animation()
-        await wait_msg.delete()
+    #     stop_animation()
+    #     await wait_msg.delete()
 
-    if not prompts:
-        await callback.message.answer("Не удалось составить варианты промптов, попробуй другой текст.")
-        return
+    # if not prompts:
+    #     await callback.message.answer("Не удалось составить варианты промптов, попробуй другой текст.")
+    #     return
 
-    # Сохраняем
-    state_data = await state.get_data()
-    prompt_sets: Dict[str, List[str]] = state_data.get("prompt_sets", {})
-    prompt_sources: Dict[str, str] = state_data.get("prompt_sources", {})
-    prompt_sets[str(callback.message.message_id)] = prompts
-    prompt_sources[str(callback.message.message_id)] = base_text
-    await state.update_data(prompt_sets=_prune_map(prompt_sets), prompt_sources=_prune_map(prompt_sources))
+    # await _consume_text_quota(callback.from_user.id)
 
-    await callback.message.answer(
-        _format_prompt_message(prompts),
-        reply_markup=prompt_suggestions_keyboard(callback.message.message_id, prompts, mode),
-        disable_web_page_preview=True,
-    )
-    await callback.answer()
+    # # Сохраняем
+    # state_data = await state.get_data()
+    # prompt_sets: Dict[str, List[str]] = state_data.get("prompt_sets", {})
+    # prompt_sources: Dict[str, str] = state_data.get("prompt_sources", {})
+    # prompt_sets[str(callback.message.message_id)] = prompts
+    # prompt_sources[str(callback.message.message_id)] = base_text
+    # await state.update_data(prompt_sets=_prune_map(prompt_sets), prompt_sources=_prune_map(prompt_sources))
+
+    # await callback.message.answer(
+    #     _format_prompt_message(prompts),
+    #     reply_markup=prompt_suggestions_keyboard(callback.message.message_id, prompts, mode),
+    #     disable_web_page_preview=True,
+    # )
+    # await callback.answer()

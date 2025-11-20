@@ -47,3 +47,6 @@ S3_MEDIA_PREFIX = os.getenv("S3_MEDIA_PREFIX", "user-media")
 
 SALEBOT_API_KEY = os.getenv('SALEBOT_API_KEY')
 SALEBOT_ADMIN_CHAT_ID = os.getenv('SALEBOT_ADMIN_CHAT_ID')
+
+
+PAYMENTS_ACTIVE = os.getenv("PAYMENTS_ACTIVE") or False
