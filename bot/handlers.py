@@ -37,6 +37,7 @@ from core.storage import (
     get_user_photo_urls,
     restore_quota,
     set_user_photo,
+    clear_user_photo
 )
 from core.utils import (
     build_file_url,
@@ -436,80 +437,76 @@ async def handle_start_work(callback: CallbackQuery):
 
 
 @router.message(F.photo)
-async def save_photo(message: Message, bot: Bot):
+async def save_photos(message: Message, bot: Bot, album: list[Message] | None = None):
+    """
+    Универсальный обработчик:
+    - album != None → это альбом (media_group)
+    - album == None → одиночное фото
+    """
+
+    messages = album if album else [message]
+
     if not message.from_user:
         await message.answer("Не распознали пользователя.")
         return
 
-    photo = message.photo[-1]
-    try:
-        file_bytes, filename = await fetch_file_bytes(bot, photo.file_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Failed to download photo: %s", exc)
-        await message.answer("Не получилось скачать фото, попробуй ещё раз.")
-        sale_client.send_error_message(
-            error_text=str(exc),
-            error_place="save_photo.fetch_file_bytes(bot, photo.file_id)")
-        return
-
-    removed_object_keys: List[str] = []
-    reference_urls: List[str] = []
+    removed_keys_total = []
 
     async with SessionLocal() as session:
+        # создаём/обновляем юзера + его подписку
         user, _ = await ensure_user_with_subscription(
             session,
             message.from_user.id,
             **_user_profile_kwargs(message.from_user),
         )
 
-        try:
-            object_key, url = await upload_bytes(
-                file_bytes, filename, message.from_user.id
-            )
-            logger.info(f" url {url}")
-        except S3ConfigError as exc:
-            logger.exception("S3 configuration error: %s", exc)
-            await message.answer(
-                "Хранилище изображений не настроено. Сообщи администратору."
-            )
-            return
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("S3 upload failed: %s", exc)
-            await message.answer("Не удалось сохранить фото, попробуй позже.")
-            sale_client.send_error_message(
-                error_text=str(exc),
-                error_place="save_photo.upload_bytes(file_bytes, filename, message.from_user.id)")
-            return
+        # Обработать каждое фото в сообщениях
+        for msg in messages:
+            photo = msg.photo[-1]
 
-        user, removed_object_keys = await set_user_photo(session, user, url, object_key)
+            # 1) скачать файл
+            try:
+                file_bytes, filename = await fetch_file_bytes(bot, photo.file_id)
+            except Exception as exc:
+                logger.exception("Failed to download photo: %s", exc)
+                await message.answer("Не получилось скачать фото.")
+                continue
+
+            # 2) загрузить в S3
+            try:
+                object_key, url = await upload_bytes(file_bytes, filename, message.from_user.id)
+            except Exception as exc:
+                logger.exception("S3 upload failed: %s", exc)
+                await message.answer("Ошибка загрузки файла в S3.")
+                continue
+
+            # 3) сохранить в базе (FIFO)
+            user, removed = await set_user_photo(session, user, url, object_key)
+            removed_keys_total.extend(removed)
+
+        await session.commit()
+
+        # получаем обновлённый список фото
         reference_urls = get_user_photo_urls(user)
-        await _commit_session(session)
 
-    for stale_key in removed_object_keys:
+    # 4) удалить старые файлы из S3
+    for stale_key in removed_keys_total:
         try:
             await delete_object(stale_key)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Failed to delete old S3 object %s: %s", stale_key, exc
-            )
-            sale_client.send_error_message(
-                error_text=str(exc),
-                error_place="save_photo.delete_object(stale_key)",
-            )
+        except Exception:
+            pass
 
-    photo_count = len(reference_urls)
-    base_text = (
-        "Используй <code>/gen &lt;описание&gt;</code> для генераций с учётом снимков."
-    )
-    if photo_count <= 1:
-        prefix = "Фото сохранено! Оно станет базовым."
-    else:
-        prefix = (
-            f"Фото сохранено! Теперь у тебя {photo_count} базовых фото "
-            f"(максимум {MAX_REFERENCE_PHOTOS})."
+    # 5) Ответ пользователю
+    if album:
+        await message.answer(
+            f"Галерея сохранена! У тебя теперь {len(reference_urls)} "
+            f"базовых фото (максимум {MAX_REFERENCE_PHOTOS})."
         )
-
-    await message.answer(f"{prefix} {base_text}")
+    else:
+        await message.answer(
+            f"Фото сохранено! Теперь у тебя {len(reference_urls)} "
+            f"базовых фото (максимум {MAX_REFERENCE_PHOTOS})."
+        )
 
 
 @quota_guard("photo")
@@ -1031,45 +1028,33 @@ async def handle_prompt_mode(callback: CallbackQuery, callback_data: PromptModeC
 
     await _generate_prompt_mode_payload(callback, state, base_text=base_text, mode=mode)
 
-    # # Подбираем инструкцию
-    # if mode == "edit":
-    #     instruction = SYSTEM_PROMPT_FOR_EDIT
-    # else:
-    #     instruction = SYSTEM_PROMPT_FOR_CREATING
+@router.message(F.text == "/reset_photos")
+async def reset_photos(message: Message):
+    if not message.from_user:
+        await message.answer("Не распознали пользователя.")
+        return
 
-    # wait_msg, stop_animation = await start_loading_animation(callback.message, "💭 Думаем над промптами")
 
-    # try:
-    #     prompts = await prompt_service.generate(text=base_text, count=PROMPT_SUGGESTION_COUNT, instruction=instruction)
-    # except Exception as exc:
-    #     logger.warning("Prompt generation failed: %s", exc)
-    #     prompts = generate_prompt_suggestions(base_text)[:PROMPT_SUGGESTION_COUNT]
-    #     sale_client.send_error_message(
-    #         error_text=str(exc),
-    #         error_place="handle_prompt_mode.prompt_service.generate")
-    #     await callback.message.answer("❌ Не удалось сгенерировать промпты, попробуй позже.")
-    # finally:
-        
-    #     stop_animation()
-    #     await wait_msg.delete()
 
-    # if not prompts:
-    #     await callback.message.answer("Не удалось составить варианты промптов, попробуй другой текст.")
-    #     return
+    async with SessionLocal() as session:
+        user, _ = await ensure_user_with_subscription(session, message.from_user.id, **_user_profile_kwargs(message.from_user), )
+        if user is None:
+            await message.answer("У тебя нет сохранённых фотографий.")
+            return
 
-    # await _consume_text_quota(callback.from_user.id)
+        # clear db
+        removed_keys = await clear_user_photo(session, user)
 
-    # # Сохраняем
-    # state_data = await state.get_data()
-    # prompt_sets: Dict[str, List[str]] = state_data.get("prompt_sets", {})
-    # prompt_sources: Dict[str, str] = state_data.get("prompt_sources", {})
-    # prompt_sets[str(callback.message.message_id)] = prompts
-    # prompt_sources[str(callback.message.message_id)] = base_text
-    # await state.update_data(prompt_sets=_prune_map(prompt_sets), prompt_sources=_prune_map(prompt_sources))
+        await session.commit()
 
-    # await callback.message.answer(
-    #     _format_prompt_message(prompts),
-    #     reply_markup=prompt_suggestions_keyboard(callback.message.message_id, prompts, mode),
-    #     disable_web_page_preview=True,
-    # )
-    # await callback.answer()
+    # Delete from S3
+    for stale_key in removed_keys:
+        try:
+            await delete_object(stale_key)
+        except Exception as exc:
+            logger.warning(f"Failed to delete S3 object {stale_key}: {exc}")
+
+    await message.answer(
+        "Все базовые фотографии удалены!\n"
+        "Можешь загрузить новые, отправив фото сюда."
+    )

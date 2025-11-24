@@ -32,17 +32,20 @@ class User(Base):
     )
 
     id = Column(Integer, primary_key=True)
-    tg_id = Column(String, nullable=True)
-    first_name = Column(String, nullable=True)
-    last_name = Column(String, nullable=True)
-    username = Column(String, nullable=True)
-    photo_url = Column(String, nullable=True)
-    photo_object_key = Column(String, nullable=True)
-    photo_urls = Column(ARRAY(String), nullable=True)
-    photo_object_keys = Column(ARRAY(String), nullable=True)
+    tg_id = Column(String, nullable=False)
+
+    first_name = Column(String)
+    last_name = Column(String)
+    username = Column(String)
+
+    photo_url = Column(String)
+    photo_object_key = Column(String)
+
+    photo_urls = Column(ARRAY(String))
+    photo_object_keys = Column(ARRAY(String))
+
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, onupdate=func.now())
-    subscription = relationship("SubsInfo", back_populates="user", uselist=False)
 
 
 class SubsInfo(Base):
@@ -53,12 +56,13 @@ class SubsInfo(Base):
     )
 
     id = Column(Integer, primary_key=True)
-    tg_id = Column(String, ForeignKey("users.tg_id", ondelete="CASCADE"), nullable=False)
-    photo_left = Column(Integer, nullable=False, default=0)
-    text_left = Column(Integer, nullable=False, default=0)
+    tg_id = Column(String, nullable=False)
+
+    photo_left = Column(Integer, nullable=False, server_default="0")
+    text_left = Column(Integer, nullable=False, server_default="0")
+
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, onupdate=func.now())
-    user = relationship("User", back_populates="subscription", uselist=False)
 
 
 QUOTA_COLUMN_MAP = {
@@ -132,7 +136,7 @@ async def ensure_user(
     
     first_name_check = first_name is not None and user.first_name != first_name
     last_name_check = last_name is not None and user.last_name != last_name
-    username_check = first_name is not None and user.username != username
+    username_check = username is not None and user.username != username
 
     if first_name_check or last_name_check or username_check:
         user.first_name = first_name
@@ -242,3 +246,15 @@ def get_user_photo_urls(user: User) -> List[str]:
     if user.photo_urls:
         return [url for url in user.photo_urls if url]
     return [user.photo_url] if user.photo_url else []
+
+
+async def clear_user_photo(session: AsyncSession, user: User) -> List[str]:
+    removed_keys = list(user.photo_object_keys or [])
+    user.photo_url = None
+    user.photo_object_key = None
+    user.photo_urls = None
+    user.photo_object_keys = None
+
+    session.add(user)
+    await session.flush()
+    return removed_keys

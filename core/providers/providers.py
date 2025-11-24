@@ -172,6 +172,11 @@ class VertexAIProvider(BaseProvider):
         contents: List[Any] = [prompt]
 
         if reference_urls:
+            logger.info(f'Start generating with VertexAIProvider and reference_urls {len(reference_urls)}')
+        else:
+            logger.info(f'Start generating with VertexAIProvider a new image')
+        
+        if reference_urls:
             async with aiohttp.ClientSession() as session:
                 for image_url in reference_urls:
                     part = await self._image_url_to_part(session, image_url)
