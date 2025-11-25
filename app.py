@@ -26,6 +26,9 @@ else:
     )
 dp = Dispatcher(storage=MemoryStorage())
 
+from bot.album_middleware import AlbumMiddleware
+dp.message.middleware(AlbumMiddleware())
+
 from bot.router import router as bot_router
 
 dp.include_router(bot_router)
