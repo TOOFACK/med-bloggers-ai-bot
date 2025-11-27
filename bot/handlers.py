@@ -63,8 +63,7 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 router = Router()
 
 image_providers = init_image_providers(
@@ -303,9 +302,9 @@ async def _perform_generation(
 
 
 async def _send_generation(message: Message, result: Dict[str, Any], caption: str):
-    provider = result.get("provider")
-    footer = f"\n\nИсточник: {provider}" if provider else ""
-    full_caption = f"{caption}{footer}"
+
+    footer = '@med_ai_photo_redactor_bot'
+    full_caption = f"{caption} \n {footer}"
 
     if len(full_caption) > 128:
         full_caption = full_caption[:128] + "…"
@@ -391,13 +390,28 @@ async def start(message: Message):
 
     instructions = (
         "🎨 <b>Привет!</b>\n\n"
-        "Я — AI-бот, который помогает <b>создавать</b> и <b>редактировать изображения</b> по описанию.\n\n"
-        "🪄 Что я умею:\n"
-        "• Пришли до 3 своих фото, где хорошо видно лицо (лучше с разных ракурсов) — я сохраню их как базу.\n"
-        "• <code>/gen</code> + описание — отредактирую твоё фото по заданию.\n"
-        "• <code>/free_gen</code> + описание — создам новое изображение с нуля.\n"
-        "• <code>/get_prompts</code> + описание — предложу варианты визуализаций. Ты выберешь: с нуля или на основе фото.\n"
-        "• Можно редактировать итеративно — просто ответь на картинку и напиши, что изменить.\n\n"
+        "Я — AI-бот, который создаёт и редактирует фотографии по описанию.\n\n"
+
+        "🪄 <b>Как работает генерация:</b>\n"
+        "• Пришли до 3 своих фото, где хорошо видно лицо (лучше с разных ракурсов).\n"
+        "• После этого <b>любое твоё текстовое сообщение</b> будет восприниматься как "
+        "<b>инструкция для генерации фото с твоим участием</b>.\n"
+        "• Опиши максимально <b>подробно и понятно</b>: образ, позу, одежду, стиль, фон, эмоции, "
+        "освещение, настроение — всё, что хочешь видеть на итоговом фото.\n"
+        "Чем детальнее описание, тем точнее и качественнее результат.\n\n"
+
+        "🖼️ <b>Если хочешь картинку без своего лица</b>\n"
+        "Используй команду <code>/free_gen</code> — она создаёт изображение полностью с нуля, "
+        "не используя твои загруженные фотографии.\n\n"
+
+        "📸 <b>Управление фотографиями:</b>\n"
+        "• <code>/my_photos</code> — покажу загруженные тобой фото.\n"
+        "• <code>/reset_photos</code> — удалю все твои фото и историю загрузок.\n\n"
+
+        "🧠 <b>Полезно для авторов контента</b>\n"
+        "Отправь <code>/get_prompts</code> + текст для поста, описание видео или Reels — и я предложу "
+        "варианты промптов для создания изображений, которые ты сможешь использовать как обложку к Reels, видео или посту в социальной сети."
+
         "👇 Нажми кнопку, чтобы начать!"
     )
 
@@ -433,7 +447,7 @@ async def handle_status(message: Message):
 
 @router.callback_query(F.data == "start_work")
 async def handle_start_work(callback: CallbackQuery):
-    await callback.message.answer("Отправь фото или введи /free_gen, чтобы начать 🚀")
+    await callback.message.answer("Отправь фото или введи текст для генерации, чтобы начать 🚀")
 
 
 @router.message(F.photo)
@@ -744,14 +758,15 @@ async def _prompt_regeneration_payload(
     return True
 
 
-@router.message(Command("gen"))
-async def generate_from_text(message: Message, command: CommandObject):
+# @router.message(Command("gen"))
+@router.message(F.text & ~F.text.startswith("/"))
+async def generate_from_text(message: Message):
     if not message.from_user:
         await message.answer("Не распознали пользователя.")
         return
-    prompt = (command.args or "").strip()
+    prompt = message.text.strip()
     if not prompt:
-        await message.answer("Укажи текст после команды: `/gen твой промпт`.")
+        await message.answer("Опиши, какую фотографию ты хочешь создать.")
         return
 
     async with SessionLocal() as session:
@@ -788,6 +803,24 @@ async def handle_get_prompts(message: Message, state: FSMContext):
     if not message.from_user or not message.text:
         return
 
+    if not message.from_user or not message.text:
+        return
+
+    # Убираем команду и оставляем только аргументы
+    # message.text может быть "/get_prompts текст"
+    parts = message.text.split(maxsplit=1)
+    user_text = parts[1].strip() if len(parts) > 1 else ""
+
+    # Проверка на пустой текст
+    if not user_text:
+        await message.answer(
+            "После команды <code>/get_prompts</code> укажи текст, "
+            "по которому нужно создать варианты промптов.\n\n"
+            "Например:\n"
+            "<code>/get_prompts Текст для моего видео про путешествия</code>"
+        )
+        return
+    
     normalized = normalize_text(message.text)
     await state.update_data(base_text=normalized)
 
@@ -901,35 +934,6 @@ async def handle_iterative_edit(message: Message, bot: Bot):
             error_place="handle_iterative_edit")
         return
 
-    # # Запускаем анимацию "генерация"
-    # wait_msg, stop_animation = await start_loading_animation(
-    #     message, "🪄 Применяем правки, подожди немного"
-    # )
-
-    # try:
-    #     # Отправляем в пайплайн Nano-Banana (через Comet/Gemini)
-    #     result = await _perform_generation(message.text, reference_urls=[file_url])
-    #     if not result:
-    #         stop_animation()
-    #         await message.answer(
-    #             "❌ Не удалось сгенерировать изображение, попробуй позже."
-    #         )
-    #         return
-
-    #     stop_animation()
-    #     await wait_msg.delete()
-
-    #     await _send_generation(
-    #         message, result, caption=f"✨ Новая версия по запросу:\n\n{message.text}"
-    #     )
-    #     await _consume_photo_quota(message.from_user.id)
-
-    # except Exception as exc:
-    #     stop_animation()
-    #     await wait_msg.edit_text(f"Что-то пошло не так, попробуйте позже...")
-    #     sale_client.send_error_message(
-    #         error_text=str(exc),
-    #         error_place="handle_iterative_edit._perform_generation")
 
     await _iterative_edit_generation(
         message,
@@ -966,34 +970,6 @@ async def generate_without_base(message: Message, command: CommandObject):
         return
 
     await _generate_without_base_payload(message, prompt=prompt)
-
-    # # Показываем анимацию
-    # wait_msg, stop_animation = await start_loading_animation(
-    #     message, "🎨 Генерируем изображение"
-    # )
-
-    # try:
-    #     # ⚡ Без reference_urls → чисто текстовая генерация
-    #     result = await _perform_generation(prompt)
-    #     if not result:
-    #         stop_animation()
-    #         await message.answer(
-    #             "❌ Не удалось сгенерировать изображение, попробуй позже."
-    #         )
-    #         return
-
-    #     stop_animation()
-    #     await wait_msg.delete()
-
-    #     await _send_generation(message, result, caption=f"Готово! 🖼\n\n{prompt}")
-    #     await _consume_photo_quota(message.from_user.id)
-
-    # except Exception as e:
-    #     stop_animation()
-    #     await wait_msg.edit_text(f"Что-то пошло не так, попробуйте позже...")
-    #     sale_client.send_error_message(
-    #         error_text=str(e),
-    #         error_place="generate_without_base._perform_generation")
         
 
 @router.callback_query(PromptModeCallback.filter())
@@ -1028,7 +1004,8 @@ async def handle_prompt_mode(callback: CallbackQuery, callback_data: PromptModeC
 
     await _generate_prompt_mode_payload(callback, state, base_text=base_text, mode=mode)
 
-@router.message(F.text == "/reset_photos")
+# @router.message(F.text == "/reset_photos")
+@router.message(Command("reset_photos"))
 async def reset_photos(message: Message):
     if not message.from_user:
         await message.answer("Не распознали пользователя.")
@@ -1058,3 +1035,56 @@ async def reset_photos(message: Message):
         "Все базовые фотографии удалены!\n"
         "Можешь загрузить новые, отправив фото сюда."
     )
+
+
+
+@router.message(Command("my_photos"))
+async def my_photos(message: Message):
+    if not message.from_user:
+        await message.answer("Не распознали пользователя.")
+        return
+
+    async with SessionLocal() as session:
+        user, _ = await ensure_user_with_subscription(
+            session,
+            message.from_user.id,
+            **_user_profile_kwargs(message.from_user),
+        )
+        photo_urls = get_user_photo_urls(user)
+        await _commit_session(session)
+
+    # Нет фото
+    if not photo_urls:
+        await message.answer(
+            "У тебя пока нет загруженных фото.\n\n"
+            "Отправь 1–3 своих фотографии, чтобы я мог использовать их при генерации."
+        )
+        return
+
+    # Есть только одно фото — просто отправляем
+    if len(photo_urls) == 1:
+        try:
+            await message.answer_photo(photo_urls[0])
+        except Exception:
+            await message.answer(f"⚠️ Не удалось загрузить фото:\n{photo_urls[0]}")
+        return
+
+
+    media_group = []
+    for url in photo_urls:
+        try:
+            media_group.append(InputMediaPhoto(media=url))
+        except Exception:
+            await message.answer(f"⚠️ Не удалось добавить фото:\n{url}")
+
+    # Отправляем альбом
+    try:
+        await message.answer_media_group(media_group)
+    except Exception:
+        # fallback — если Telegram ругнётся на какой-то URL
+        await message.answer("⚠️ Не удалось отправить альбом. Покажу фото по одному.")
+        for url in photo_urls:
+            try:
+                await message.answer_photo(url)
+            except Exception:
+                await message.answer(f"⚠️ Ошибка загрузки фото:\n{url}")
