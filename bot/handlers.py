@@ -368,7 +368,7 @@ async def _perform_generation(
 async def _send_generation(message: Message, result: Dict[str, Any], caption: str):
 
     footer = '@med_ai_photo_redactor_bot'
-    full_caption = f"{caption} \n {footer}"
+    full_caption = f"Результат генрации\n{footer}"
 
     if len(full_caption) > 128:
         full_caption = full_caption[:128] + "…"

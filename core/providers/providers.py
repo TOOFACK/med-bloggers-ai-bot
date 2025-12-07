@@ -209,14 +209,26 @@ class VertexAIProvider(BaseProvider):
 
 
     async def _image_url_to_part(self, session, image_url):
-        # Google сам скачает и обработает URI, нам не нужно трогать байты
         try:
-            return types.Part.from_uri(
-                file_uri=image_url,
-                mime_type="image/jpeg"
-            )
+            async with session.get(image_url) as response:
+                if response.status != 200:
+                    logger.warning(
+                        "VertexAIProvider: can't download %s, status %s",
+                        image_url,
+                        response.status,
+                    )
+                    return None
+
+                mime = response.headers.get("Content-Type", "image/jpeg")
+                if mime in ("application/octet-stream", None, ""):
+                    mime = "image/jpeg"  # Telegram иногда отдаёт так
+
+                raw = await response.read()
+                return types.Part.from_bytes(data=raw, mime_type=mime)
         except Exception as exc:
-            logger.warning("VertexAIProvider: can't create Part from %s: %s", image_url, exc)
+            logger.warning(
+                "VertexAIProvider: can't create Part from %s: %s", image_url, exc
+            )
             return None
 
 
