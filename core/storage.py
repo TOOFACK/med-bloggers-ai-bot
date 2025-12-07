@@ -11,6 +11,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Index,
     update,
+    Boolean,
 )
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +23,7 @@ logging.basicConfig(level=logging.INFO)
 Base = declarative_base()
 
 MAX_REFERENCE_PHOTOS = 3
+FREE_TRIAL_QUOTA = 5
 
 
 class User(Base):
@@ -44,6 +46,9 @@ class User(Base):
     photo_urls = Column(ARRAY(String))
     photo_object_keys = Column(ARRAY(String))
 
+    is_test_end = Column(Boolean, nullable=False, server_default="false")
+    is_blocked = Column(Boolean, nullable=False, server_default="false")
+
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, onupdate=func.now())
 
@@ -58,8 +63,8 @@ class SubsInfo(Base):
     id = Column(Integer, primary_key=True)
     tg_id = Column(String, nullable=False)
 
-    photo_left = Column(Integer, nullable=False, server_default="0")
-    text_left = Column(Integer, nullable=False, server_default="0")
+    photo_left = Column(Integer, nullable=False, server_default=str(FREE_TRIAL_QUOTA))
+    text_left = Column(Integer, nullable=False, server_default=str(FREE_TRIAL_QUOTA))
 
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, onupdate=func.now())
@@ -88,6 +93,8 @@ async def _apply_quota_delta(
     user: User,
     quota_type: str,
     delta: int,
+    *,
+    mark_test_end_on_exhaust: bool = False,
 ) -> bool:
     column = _quota_column(quota_type)
     stmt = update(SubsInfo).where(SubsInfo.tg_id == user.tg_id)
@@ -95,7 +102,17 @@ async def _apply_quota_delta(
         stmt = stmt.where(column >= -delta)
     stmt = stmt.values({column.key: column + delta}).returning(column)
     result = await session.execute(stmt)
-    updated = result.scalar_one_or_none() is not None
+    new_value = result.scalar_one_or_none()
+    updated = new_value is not None
+    if (
+        updated
+        and mark_test_end_on_exhaust
+        and new_value is not None
+        and new_value <= 0
+        and not user.is_test_end
+    ):
+        user.is_test_end = True
+        session.add(user)
     if updated:
         await session.flush()
     return updated
@@ -104,7 +121,13 @@ async def _apply_quota_delta(
 async def consume_quota(
     session: AsyncSession, user: User, quota_type: str, amount: int = 1
 ) -> bool:
-    return await _apply_quota_delta(session, user, quota_type, -amount)
+    return await _apply_quota_delta(
+        session,
+        user,
+        quota_type,
+        -amount,
+        mark_test_end_on_exhaust=True,
+    )
 
 
 async def restore_quota(
@@ -156,7 +179,11 @@ async def ensure_subscription(session: AsyncSession, user: User) -> SubsInfo:
     )
     subscription = result.scalar_one_or_none()
     if subscription is None:
-        subscription = SubsInfo(tg_id=user.tg_id)
+        subscription = SubsInfo(
+            tg_id=user.tg_id,
+            photo_left=FREE_TRIAL_QUOTA,
+            text_left=FREE_TRIAL_QUOTA,
+        )
         session.add(subscription)
         await session.flush()
     return subscription

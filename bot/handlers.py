@@ -177,6 +177,7 @@ def _quota_warning_message(tg_id: int, quota_type: str) -> str:
 
 
 QuotaType = Literal["photo", "text"]
+ReserveStatus = Literal["ok", "blocked", "exhausted"]
 
 
 async def _notify_missing_user(target: Message | CallbackQuery) -> None:
@@ -184,6 +185,36 @@ async def _notify_missing_user(target: Message | CallbackQuery) -> None:
         await target.answer("Не распознали пользователя.", show_alert=True)
     else:
         await target.answer("Не распознали пользователя.")
+
+
+async def _notify_blocked_user(target: Message | CallbackQuery) -> None:
+    text = "Доступ к боту заблокирован. Обратись к администратору."
+    if isinstance(target, CallbackQuery):
+        await target.message.answer(text)
+        try:
+            await target.answer("Доступ заблокирован.", show_alert=True)
+        except TelegramBadRequest:
+            pass
+    else:
+        await target.answer(text)
+
+
+async def _ensure_user_allowed(target: Message | CallbackQuery) -> bool:
+    from_user = getattr(target, "from_user", None)
+    if from_user is None:
+        await _notify_missing_user(target)
+        return False
+    async with SessionLocal() as session:
+        user, _ = await ensure_user_with_subscription(
+            session,
+            from_user.id,
+            **_user_profile_kwargs(from_user),
+        )
+        await _commit_session(session)
+    if user.is_blocked:
+        await _notify_blocked_user(target)
+        return False
+    return True
 
 
 async def _notify_quota_exhausted(
@@ -208,19 +239,40 @@ async def _reserve_quota(
     *,
     amount: int = 1,
     profile: Optional[Dict[str, Optional[str]]] = None,
-) -> bool:
+) -> ReserveStatus:
     if not PAYMENTS_ACTIVE:
-        return True
+        return "ok"
     async with SessionLocal() as session:
-        user, _ = await ensure_user_with_subscription(
+        user, subscription = await ensure_user_with_subscription(
             session, tg_id, **(profile or {})
         )
+        if user.is_blocked:
+            await _commit_session(session)
+            return "blocked"
+
+        quota_left = (
+            subscription.photo_left if quota_type == "photo" else subscription.text_left
+        )
+
+        if quota_left is not None and quota_left < amount:
+            if not user.is_test_end:
+                user.is_test_end = True
+                session.add(user)
+            await _commit_session(session)
+            return "exhausted"
+
         updated = await consume_quota(session, user, quota_type, amount)
         if not updated:
-            await session.rollback()
-            return False
+            if not user.is_test_end:
+                user.is_test_end = True
+                session.add(user)
+                await _commit_session(session)
+            else:
+                await session.rollback()
+            return "exhausted"
+
         await _commit_session(session)
-        return True
+        return "ok"
 
 
 async def _return_quota(
@@ -242,16 +294,28 @@ def quota_guard(quota_type: QuotaType, *, amount: int = 1):
             if from_user is None:
                 await _notify_missing_user(target)
                 return False
-            if not PAYMENTS_ACTIVE:
-                return await func(target, *args, **kwargs)
             profile = _user_profile_kwargs(from_user)
-            reserved = await _reserve_quota(
+            if not PAYMENTS_ACTIVE:
+                async with SessionLocal() as session:
+                    user, _ = await ensure_user_with_subscription(
+                        session, from_user.id, **profile
+                    )
+                    await _commit_session(session)
+                if user.is_blocked:
+                    await _notify_blocked_user(target)
+                    return False
+                return await func(target, *args, **kwargs)
+
+            reserve_status = await _reserve_quota(
                 from_user.id,
                 quota_type,
                 amount=amount,
                 profile=profile,
             )
-            if not reserved:
+            if reserve_status == "blocked":
+                await _notify_blocked_user(target)
+                return False
+            if reserve_status == "exhausted":
                 await _notify_quota_exhausted(target, quota_type)
                 return False
             try:
@@ -380,13 +444,8 @@ async def start(message: Message):
         await message.answer("Не распознали пользователя.")
         return
 
-    async with SessionLocal() as session:
-        await ensure_user_with_subscription(
-            session,
-            message.from_user.id,
-            **_user_profile_kwargs(message.from_user),
-        )
-        await _commit_session(session)
+    if not await _ensure_user_allowed(message):
+        return
 
     instructions = (
         "🎨 <b>Привет!</b>\n\n"
@@ -394,24 +453,34 @@ async def start(message: Message):
 
         "🪄 <b>Как работает генерация:</b>\n"
         "• Пришли до 3 своих фото, где хорошо видно лицо (лучше с разных ракурсов).\n"
-        "• После этого <b>любое твоё текстовое сообщение</b> будет восприниматься как "
-        "<b>инструкция для генерации фото с твоим участием</b>.\n"
-        "• Опиши максимально <b>подробно и понятно</b>: образ, позу, одежду, стиль, фон, эмоции, "
-        "освещение, настроение — всё, что хочешь видеть на итоговом фото.\n"
-        "Чем детальнее описание, тем точнее и качественнее результат.\n\n"
+        "• После загрузки фото <b>любое твоё текстовое сообщение</b> становится инструкцией "
+        "для генерации изображения с твоим участием.\n"
+        "• Опиши максимально <b>подробно</b> образ, позу, стиль, одежду, фон, эмоции, "
+        "освещение и настроение — чем детальнее, тем лучше результат.\n\n"
 
-        "🖼️ <b>Если хочешь картинку без своего лица</b>\n"
-        "Используй команду <code>/free_gen</code> — она создаёт изображение полностью с нуля, "
-        "не используя твои загруженные фотографии.\n\n"
+        "🖼️ <b>Если нужна картинка без твоего лица</b>\n"
+        "Используй команду <code>/free_gen</code> — она создаёт изображение полностью с нуля.\n\n"
 
         "📸 <b>Управление фотографиями:</b>\n"
         "• <code>/my_photos</code> — покажу загруженные тобой фото.\n"
-        "• <code>/reset_photos</code> — удалю все твои фото и историю загрузок.\n\n"
+        "• <code>/reset_photos</code> — удалю все твои фото.\n\n"
 
-        "🧠 <b>Полезно для авторов контента</b>\n"
-        "Отправь <code>/get_prompts</code> + текст для поста, описание видео или Reels — и я предложу "
-        "варианты промптов для создания изображений, которые ты сможешь использовать как обложку к Reels, видео или посту в социальной сети."
+        "🧠 <b>Инструмент для авторов контента:</b>\n"
+        "Отправь <code>/get_prompts</code> + текст для поста/видео — и я сгенерирую варианты промптов "
+        "для обложек Reels, видео или постов.\n\n"
 
+        "👤 <b>Личный кабинет</b>\n"
+        "Проверить оставшиеся генерации: <code>/cabinet</code>\n\n"
+
+        "💰 <b>Прейскурант</b>\n"
+        "Каждому новому пользователю даётся:\n"
+        "• 5 бесплатных генераций изображений\n"
+        "• 5 бесплатных промптов\n\n"
+        "После исчерпания лимита пополнить баланс можно у администратора.\n\n"
+        "💳 <b>Тарифы:</b>\n"
+        "• 20 фото + 20 промптов — 590 ₽\n"
+        "• 50 фото + 50 промптов — 990 ₽\n"
+        "• 100 фото + 100 промптов — 1490 ₽\n\n"
         "👇 Нажми кнопку, чтобы начать!"
     )
 
@@ -431,16 +500,23 @@ async def handle_status(message: Message):
         return
 
     if not PAYMENTS_ACTIVE:
-        await message.answer(_format_subscription_status_message(message.from_user.id, None))
+        if not await _ensure_user_allowed(message):
+            return
+        await message.answer(
+            _format_subscription_status_message(message.from_user.id, None)
+        )
         return
 
     async with SessionLocal() as session:
-        _, subscription = await ensure_user_with_subscription(
+        user, subscription = await ensure_user_with_subscription(
             session,
             message.from_user.id,
             **_user_profile_kwargs(message.from_user),
         )
         await _commit_session(session)
+    if user.is_blocked:
+        await _notify_blocked_user(message)
+        return
 
     await message.answer(_format_subscription_status_message(message.from_user.id, subscription))
 
@@ -473,6 +549,10 @@ async def save_photos(message: Message, bot: Bot, album: list[Message] | None = 
             message.from_user.id,
             **_user_profile_kwargs(message.from_user),
         )
+        if user.is_blocked:
+            await _commit_session(session)
+            await _notify_blocked_user(message)
+            return
 
         # Обработать каждое фото в сообщениях
         for msg in messages:
@@ -759,7 +839,7 @@ async def _prompt_regeneration_payload(
 
 
 # @router.message(Command("gen"))
-@router.message(F.text & ~F.text.startswith("/"))
+@router.message(F.text & ~F.text.startswith("/") & ~F.reply_to_message)
 async def generate_from_text(message: Message):
     if not message.from_user:
         await message.answer("Не распознали пользователя.")
@@ -775,8 +855,20 @@ async def generate_from_text(message: Message):
             message.from_user.id,
             **_user_profile_kwargs(message.from_user),
         )
+        if user.is_blocked:
+            await _commit_session(session)
+            await _notify_blocked_user(message)
+            return
         photo_urls = get_user_photo_urls(user)
         photo_left = subscription.photo_left if PAYMENTS_ACTIVE else None
+        if (
+            PAYMENTS_ACTIVE
+            and photo_left is not None
+            and photo_left <= 0
+            and not user.is_test_end
+        ):
+            user.is_test_end = True
+            session.add(user)
         await _commit_session(session)
 
     if PAYMENTS_ACTIVE and photo_left is not None and photo_left <= 0:
@@ -819,6 +911,9 @@ async def handle_get_prompts(message: Message, state: FSMContext):
             "Например:\n"
             "<code>/get_prompts Текст для моего видео про путешествия</code>"
         )
+        return
+
+    if not await _ensure_user_allowed(message):
         return
     
     normalized = normalize_text(message.text)
@@ -864,8 +959,20 @@ async def handle_prompt_choice(
             callback.from_user.id,
             **_user_profile_kwargs(callback.from_user),
         )
+        if user.is_blocked:
+            await _commit_session(session)
+            await _notify_blocked_user(callback)
+            return
         photo_urls = get_user_photo_urls(user)
         photo_left = subscription.photo_left if PAYMENTS_ACTIVE else None
+        if (
+            PAYMENTS_ACTIVE
+            and photo_left is not None
+            and photo_left <= 0
+            and not user.is_test_end
+        ):
+            user.is_test_end = True
+            session.add(user)
         await _commit_session(session)
 
     if PAYMENTS_ACTIVE and photo_left is not None and photo_left <= 0:
@@ -889,6 +996,8 @@ async def handle_prompt_choice(
 
 @router.callback_query(PromptRegenCallback.filter())
 async def handle_prompt_regenerate(callback: CallbackQuery, callback_data: PromptRegenCallback, state: FSMContext):
+    if not await _ensure_user_allowed(callback):
+        return
     mode = callback_data.mode
     state_data = await state.get_data()
     prompt_sources: Dict[str, str] = state_data.get("prompt_sources", {})
@@ -957,12 +1066,24 @@ async def generate_without_base(message: Message, command: CommandObject):
         return
 
     async with SessionLocal() as session:
-        _, subscription = await ensure_user_with_subscription(
+        user, subscription = await ensure_user_with_subscription(
             session,
             message.from_user.id,
             **_user_profile_kwargs(message.from_user),
         )
+        if user.is_blocked:
+            await _commit_session(session)
+            await _notify_blocked_user(message)
+            return
         photo_left = subscription.photo_left if PAYMENTS_ACTIVE else None
+        if (
+            PAYMENTS_ACTIVE
+            and photo_left is not None
+            and photo_left <= 0
+            and not user.is_test_end
+        ):
+            user.is_test_end = True
+            session.add(user)
         await _commit_session(session)
 
     if PAYMENTS_ACTIVE and photo_left is not None and photo_left <= 0:
@@ -981,15 +1102,25 @@ async def handle_prompt_mode(callback: CallbackQuery, callback_data: PromptModeC
         await callback.answer("Не нашли исходный текст, попробуй снова.", show_alert=True)
         return
 
+    if not PAYMENTS_ACTIVE and not await _ensure_user_allowed(callback):
+        return
+
     text_left: Optional[int] = None
     if PAYMENTS_ACTIVE:
         async with SessionLocal() as session:
-            _, subscription = await ensure_user_with_subscription(
+            user, subscription = await ensure_user_with_subscription(
                 session,
                 callback.from_user.id,
                 **_user_profile_kwargs(callback.from_user),
             )
+            if user.is_blocked:
+                await _commit_session(session)
+                await _notify_blocked_user(callback)
+                return
             text_left = subscription.text_left
+            if text_left is not None and text_left <= 0 and not user.is_test_end:
+                user.is_test_end = True
+                session.add(user)
             await _commit_session(session)
 
         if text_left is not None and text_left <= 0:
@@ -1017,6 +1148,10 @@ async def reset_photos(message: Message):
         user, _ = await ensure_user_with_subscription(session, message.from_user.id, **_user_profile_kwargs(message.from_user), )
         if user is None:
             await message.answer("У тебя нет сохранённых фотографий.")
+            return
+        if user.is_blocked:
+            await _commit_session(session)
+            await _notify_blocked_user(message)
             return
 
         # clear db
