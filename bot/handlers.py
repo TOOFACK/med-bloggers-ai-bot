@@ -161,6 +161,7 @@ def _format_subscription_status_message(tg_id: int, subscription: Optional[SubsI
         "📊 <b>Личный кабинет</b>\n"
         f"Генераций изображений осталось: <b>{_fmt(subscription.photo_left)}</b>\n"
         f"Запросов промптов осталось: <b>{_fmt(subscription.text_left)}</b>\n"
+        '<a href="https://t.me/m/OC5FwjxIMzEy">Пополни подписку в отделе заботы</a>\n'
     )
 
 
@@ -169,11 +170,13 @@ def _quota_warning_message(tg_id: int, quota_type: str) -> str:
         label = "генерации изображений"
     else:
         label = "запросы на промпты"
+
     return (
-        f"Закончились {label}. Пополни подписку у администратора.\n"
-        f"Твой Telegram ID: <code>{tg_id}</code>\n"
+        f"Закончились {label}.\n"
+        '<a href="https://t.me/m/OC5FwjxIMzEy">Пополни подписку в отделе заботы</a>\n'
         "Используй команду /cabinet, чтобы проверить баланс."
     )
+
 
 
 QuotaType = Literal["photo", "text"]
@@ -230,7 +233,7 @@ async def _notify_quota_exhausted(
         except TelegramBadRequest:
             pass
     else:
-        await target.answer(warning)
+        await target.answer(warning, parse_mode="HTML")
 
 
 async def _reserve_quota(
@@ -476,7 +479,8 @@ async def start(message: Message):
         "Каждому новому пользователю даётся:\n"
         "• 5 бесплатных генераций изображений\n"
         "• 5 бесплатных промптов\n\n"
-        "После исчерпания лимита пополнить баланс можно у администратора.\n\n"
+        "После исчерпания лимита пополнить баланс можно в "
+        "<a href='https://t.me/m/OC5FwjxIMzEy'>отделе заботы</a>\n\n"
         "💳 <b>Тарифы:</b>\n"
         "• 20 фото + 20 промптов — 590 ₽\n"
         "• 50 фото + 50 промптов — 990 ₽\n"
@@ -484,13 +488,7 @@ async def start(message: Message):
         "👇 Нажми кнопку, чтобы начать!"
     )
 
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🚀 Начать работу", callback_data="start_work")]
-        ]
-    )
-
-    await message.answer(instructions, reply_markup=keyboard)
+    await message.answer(instructions, parse_mode="HTML")
 
 
 @router.message(Command("cabinet", "balance"))
@@ -503,7 +501,7 @@ async def handle_status(message: Message):
         if not await _ensure_user_allowed(message):
             return
         await message.answer(
-            _format_subscription_status_message(message.from_user.id, None)
+            _format_subscription_status_message(message.from_user.id, None), format_mode="HTML"
         )
         return
 
@@ -518,7 +516,7 @@ async def handle_status(message: Message):
         await _notify_blocked_user(message)
         return
 
-    await message.answer(_format_subscription_status_message(message.from_user.id, subscription))
+    await message.answer(_format_subscription_status_message(message.from_user.id, subscription), format_mode="HTML")
 
 
 @router.callback_query(F.data == "start_work")
@@ -872,7 +870,7 @@ async def generate_from_text(message: Message):
         await _commit_session(session)
 
     if PAYMENTS_ACTIVE and photo_left is not None and photo_left <= 0:
-        await message.answer(_quota_warning_message(message.from_user.id, "photo"))
+        await message.answer(_quota_warning_message(message.from_user.id, "photo"), parse_mode="HTML")
         return
 
     if not photo_urls:
@@ -977,7 +975,7 @@ async def handle_prompt_choice(
 
     if PAYMENTS_ACTIVE and photo_left is not None and photo_left <= 0:
         await callback.message.answer(
-            _quota_warning_message(callback.from_user.id, "photo")
+            _quota_warning_message(callback.from_user.id, "photo"), parse_mode="HTML"
         )
         await callback.answer("Закончились генерации", show_alert=True)
         return
@@ -1087,7 +1085,7 @@ async def generate_without_base(message: Message, command: CommandObject):
         await _commit_session(session)
 
     if PAYMENTS_ACTIVE and photo_left is not None and photo_left <= 0:
-        await message.answer(_quota_warning_message(message.from_user.id, "photo"))
+        await message.answer(_quota_warning_message(message.from_user.id, "photo"), parse_mode="HTML")
         return
 
     await _generate_without_base_payload(message, prompt=prompt)
@@ -1125,7 +1123,7 @@ async def handle_prompt_mode(callback: CallbackQuery, callback_data: PromptModeC
 
         if text_left is not None and text_left <= 0:
             await callback.message.answer(
-                _quota_warning_message(callback.from_user.id, "text")
+                _quota_warning_message(callback.from_user.id, "text"), parse_mode="HTML"
             )
             await callback.answer("Нет лимита на промпты", show_alert=True)
             return
