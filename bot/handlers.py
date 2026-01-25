@@ -159,8 +159,8 @@ def _format_subscription_status_message(tg_id: int, subscription: Optional[SubsI
 
     return (
         "📊 <b>Личный кабинет</b>\n"
-        f"Генераций изображений осталось: <b>{_fmt(subscription.photo_left)}</b>\n"
-        f"Запросов промптов осталось: <b>{_fmt(subscription.text_left)}</b>\n"
+        f"Осталось генераций изображений: <b>{_fmt(subscription.photo_left)}</b>\n"
+        f"Осталось запросов промптов: <b>{_fmt(subscription.text_left)}</b>\n"
         '<a href="https://t.me/m/OC5FwjxIMzEy">Пополни подписку в отделе заботы</a>\n'
     )
 
@@ -371,7 +371,7 @@ async def _perform_generation(
 async def _send_generation(message: Message, result: Dict[str, Any], caption: str):
 
     footer = '@med_ai_photo_redactor_bot'
-    full_caption = f"Результат генрации\n{footer}"
+    full_caption = f"Результат генерации\n{footer}"
 
     if len(full_caption) > 128:
         full_caption = full_caption[:128] + "…"
