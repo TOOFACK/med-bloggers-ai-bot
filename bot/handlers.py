@@ -19,6 +19,7 @@ from config import (
     OPENROUTER_API_KEY,
     OPENROUTER_BASE_URL,
     PAYMENTS_ACTIVE,
+    REFERRALS_ACTIVE,
     VERTEX_ASPECT_RATIO,
     VERTEX_CREDENTIALS_PATH,
     VERTEX_IMAGE_MODEL,
@@ -34,13 +35,16 @@ from core.storage import (
     SubsInfo,
     consume_quota,
     ensure_user_with_subscription,
+    get_or_create_referral,
     get_user_photo_urls,
     restore_quota,
     set_user_photo,
-    clear_user_photo
+    clear_user_photo,
+    use_referral,
 )
 from core.utils import (
     build_file_url,
+    build_referral_link,
     fetch_file_bytes,
     generate_prompt_suggestions,
     input_file_from_base64,
@@ -450,6 +454,21 @@ async def start(message: Message):
     if not await _ensure_user_allowed(message):
         return
 
+    referral_reward = 0
+    if REFERRALS_ACTIVE:
+        args = ""
+        try:
+            args = message.get_args()
+        except AttributeError:
+            if message.text and " " in message.text:
+                args = message.text.split(maxsplit=1)[1]
+        if args:
+            async with SessionLocal() as session:
+                referral_reward = await use_referral(
+                    session, message.from_user.id, args, author="system"
+                )
+                await _commit_session(session)
+
     instructions = (
         "🎨 <b>Привет!</b>\n\n"
         "Я — AI-бот, который создаёт и редактирует фотографии по описанию.\n\n"
@@ -488,6 +507,12 @@ async def start(message: Message):
         "👇 Нажми кнопку, чтобы начать!"
     )
 
+    if referral_reward > 0:
+        await message.answer(
+            f"🎁 Начислил бонус по реферальной ссылке: +{referral_reward} "
+            "генераций изображений и промптов.",
+            parse_mode="HTML",
+        )
     await message.answer(instructions, parse_mode="HTML")
 
 
@@ -517,6 +542,38 @@ async def handle_status(message: Message):
         return
 
     await message.answer(_format_subscription_status_message(message.from_user.id, subscription), format_mode="HTML")
+
+
+@router.message(Command("ref", "referral"))
+async def handle_referral(message: Message):
+    if not message.from_user:
+        await message.answer("Не распознали пользователя.")
+        return
+
+    if not await _ensure_user_allowed(message):
+        return
+
+    if not REFERRALS_ACTIVE:
+        await message.answer("Реферальная программа сейчас отключена.")
+        return
+
+    bot_user = await message.bot.get_me()
+    if not bot_user or not bot_user.username:
+        await message.answer("Не удалось получить username бота.")
+        return
+
+    async with SessionLocal() as session:
+        referral = await get_or_create_referral(session, message.from_user.id)
+        await _commit_session(session)
+
+    link = build_referral_link(bot_user.username, referral.code)
+    await message.answer(
+        "🔗 <b>Твоя реферальная ссылка</b>\n"
+        f"{link}\n\n"
+        f"Бонус за вход: <b>{referral.reward_generations}</b> "
+        "генераций изображений и промптов.",
+        parse_mode="HTML",
+    )
 
 
 @router.callback_query(F.data == "start_work")

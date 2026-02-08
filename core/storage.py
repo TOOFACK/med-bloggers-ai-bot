@@ -1,21 +1,26 @@
 from typing import List, Optional, Tuple
 
+import enum
+import secrets
+
 from sqlalchemy import (
+    BigInteger,
+    Boolean,
     Column,
     DateTime,
-    ForeignKey,
+    Enum as SAEnum,
+    Index,
     Integer,
     String,
+    UniqueConstraint,
     func,
     select,
-    UniqueConstraint,
-    Index,
     update,
-    Boolean,
 )
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import declarative_base, relationship
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import declarative_base
 
 import logging
 logging.basicConfig(level=logging.INFO)
@@ -76,8 +81,159 @@ QUOTA_COLUMN_MAP = {
 }
 
 
+class GenerationSource(str, enum.Enum):
+    REF = "ref"
+    PAID = "paid"
+
+
+class Referral(Base):
+    __tablename__ = "refs"
+
+    owner_tg_id = Column(String, primary_key=True)
+    code = Column(String(64), nullable=False, unique=True, index=True)
+    reward_generations = Column(Integer, nullable=False, server_default="1")
+    is_active = Column(Boolean, nullable=False, server_default="true")
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class GenerationLedger(Base):
+    __tablename__ = "generation_ledger"
+    __table_args__ = (
+        Index("idx_generation_ledger_tg_id", "tg_id"),
+        Index("idx_generation_ledger_ref_code", "referral_code"),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    tg_id = Column(String, nullable=False)
+    source = Column(
+        SAEnum(
+            GenerationSource,
+            name="generation_source",
+            values_callable=lambda enum_cls: [item.value for item in enum_cls],
+        ),
+        nullable=False,
+    )
+    amount = Column(Integer, nullable=False)
+    referral_owner_tg_id = Column(String)
+    referral_code = Column(String(64))
+    author = Column(String(16), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+def _normalize_tg_id(tg_id: int | str) -> str:
+    if tg_id is None:
+        raise ValueError("Invalid tg_id: None")
+    value = str(tg_id).strip()
+    if not value:
+        raise ValueError(f"Invalid tg_id: {tg_id!r}")
+    return value
+
+
+def generate_referral_code(length: int = 6) -> str:
+    if length < 4:
+        raise ValueError("Referral code length must be >= 4")
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789abcdefghijkmnpqrstuvwxyz"
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+async def use_referral(
+    session: AsyncSession,
+    tg_id: int | str,
+    code: str,
+    *,
+    author: str = "system",
+) -> int:
+    if not code:
+        return 0
+    normalized_tg_id = _normalize_tg_id(tg_id)
+    result = await session.execute(
+        select(Referral).where(Referral.code == code)
+    )
+    referral = result.scalar_one_or_none()
+    if referral is None or not referral.is_active:
+        return 0
+    if referral.owner_tg_id == normalized_tg_id:
+        return 0
+
+    result = await session.execute(
+        select(GenerationLedger.id).where(
+            GenerationLedger.tg_id == normalized_tg_id,
+            GenerationLedger.source == GenerationSource.REF,
+        )
+    )
+    if result.scalar_one_or_none() is not None:
+        return 0
+
+    user, _ = await ensure_user_with_subscription(session, normalized_tg_id)
+
+    reward = max(int(referral.reward_generations), 0)
+    if reward <= 0:
+        return 0
+
+    history = GenerationLedger(
+        tg_id=normalized_tg_id,
+        source=GenerationSource.REF,
+        amount=reward,
+        referral_owner_tg_id=referral.owner_tg_id,
+        referral_code=referral.code,
+        author=author,
+    )
+    session.add(history)
+    try:
+        await session.flush()
+    except IntegrityError:
+        await session.rollback()
+        return 0
+
+    await restore_quota(session, user, "photo", reward)
+    await restore_quota(session, user, "text", reward)
+    return reward
+
+
+async def get_or_create_referral(
+    session: AsyncSession,
+    owner_tg_id: int | str,
+    *,
+    reward_generations: int = 1,
+    is_active: bool = True,
+    code_length: int = 6,
+) -> Referral:
+    normalized_tg_id = _normalize_tg_id(owner_tg_id)
+    result = await session.execute(
+        select(Referral).where(Referral.owner_tg_id == normalized_tg_id)
+    )
+    referral = result.scalar_one_or_none()
+    if referral is not None:
+        return referral
+
+    attempts = 0
+    while attempts < 10:
+        code = generate_referral_code(code_length)
+        referral = Referral(
+            owner_tg_id=normalized_tg_id,
+            code=code,
+            reward_generations=reward_generations,
+            is_active=is_active,
+        )
+        session.add(referral)
+        try:
+            await session.flush()
+            return referral
+        except IntegrityError:
+            await session.rollback()
+            attempts += 1
+
+    raise RuntimeError("Failed to generate a unique referral code")
+
+
 async def get_user_by_tg_id(session: AsyncSession, tg_id: int | str) -> Optional[User]:
-    result = await session.execute(select(User).where(User.tg_id == str(tg_id)))
+    result = await session.execute(select(User).where(User.tg_id == _normalize_tg_id(tg_id)))
     return result.scalar_one_or_none()
 
 
@@ -143,10 +299,11 @@ async def ensure_user(
     last_name: Optional[str] = None,
     username: Optional[str] = None,
 ) -> User:
-    user = await get_user_by_tg_id(session, tg_id)
+    normalized_tg_id = _normalize_tg_id(tg_id)
+    user = await get_user_by_tg_id(session, normalized_tg_id)
     if user is None:
         user = User(
-            tg_id=str(tg_id),
+            tg_id=normalized_tg_id,
             first_name=first_name,
             last_name=last_name,
             username=username,

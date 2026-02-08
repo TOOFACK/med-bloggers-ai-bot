@@ -23,6 +23,15 @@ def truncate_for_button(text: str, limit: int = 48) -> str:
     return text[: limit - 1] + "…"
 
 
+def build_referral_link(bot_username: str, code: str) -> str:
+    if not bot_username:
+        raise ValueError("bot_username is required")
+    if not code:
+        raise ValueError("code is required")
+    username = bot_username[1:] if bot_username.startswith("@") else bot_username
+    return f"https://t.me/{username}?start={code}"
+
+
 def generate_prompt_suggestions(
     text: str, patterns: tuple[str, ...] = DEFAULT_SUGGESTION_PATTERNS
 ) -> List[str]:
